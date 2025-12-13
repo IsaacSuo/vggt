@@ -90,25 +90,37 @@ class PhongTrainer:
         )
 
         # 加载预训练权重
-        pretrained_path = self.config.get('pretrained_checkpoint')
-        if pretrained_path and os.path.exists(pretrained_path):
-            print(f"[PhongTrainer] Loading pretrained weights from: {pretrained_path}")
-            checkpoint = torch.load(pretrained_path, map_location='cpu')
+        pretrained_path = self.config.get('pretrained_checkpoint', 'facebook/VGGT-1B')
 
-            # 处理checkpoint格式
-            if 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
+        if pretrained_path:
+            print(f"[PhongTrainer] Loading pretrained weights from: {pretrained_path}")
+
+            if os.path.exists(pretrained_path):
+                # 从本地文件加载
+                checkpoint = torch.load(pretrained_path, map_location='cpu')
+                if 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                elif 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
             else:
-                state_dict = checkpoint
+                # 从HuggingFace加载
+                from vggt.models.vggt import VGGT as VGGT_Pretrained
+                pretrained_model = VGGT_Pretrained.from_pretrained(pretrained_path)
+                state_dict = pretrained_model.state_dict()
+                del pretrained_model  # 释放内存
+
+            # 过滤掉新head的权重 (material_head, light_head)
+            state_dict_filtered = {
+                k: v for k, v in state_dict.items()
+                if not k.startswith(('material_head', 'light_head'))
+            }
 
             # 加载权重 (strict=False 允许新增head的权重缺失)
-            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
-            print(f"[PhongTrainer] Loaded weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-
-            if missing:
-                print(f"[PhongTrainer] Missing keys (expected for new heads): {missing[:5]}...")
+            missing, unexpected = self.model.load_state_dict(state_dict_filtered, strict=False)
+            print(f"[PhongTrainer] Loaded {len(state_dict_filtered)} pretrained weights")
+            print(f"[PhongTrainer] Missing keys (new heads): {len(missing)}")
 
         # 冻结backbone
         self._freeze_backbone()

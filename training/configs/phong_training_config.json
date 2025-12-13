@@ -1,6 +1,6 @@
 {
   "experiment_name": "phong_material_light_v1",
-  "description": "Train MaterialHead and LightHead for PBR rendering",
+  "description": "Train MaterialHead and LightHead for Phong rendering",
 
   "device": "cuda",
   "use_amp": false,
@@ -9,7 +9,7 @@
   "print_freq": 10,
   "viz_interval": 500,
 
-  "pretrained_checkpoint": null,
+  "pretrained_checkpoint": "facebook/VGGT-1B",
 
   "freeze_patterns": [
     "patch_embed",
