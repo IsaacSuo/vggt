@@ -164,6 +164,7 @@ class PhongTrainer:
             ambient_strength=renderer_config.get('ambient_strength', 0.3),
             use_learnable_light=renderer_config.get('use_learnable_light', True),
         )
+        self.renderer.to(self.device)  # 移动到GPU
         print("[PhongTrainer] Renderer initialized")
 
     def _setup_loss(self):
@@ -250,12 +251,29 @@ class PhongTrainer:
         with torch.cuda.amp.autocast(enabled=self.config.get('use_amp', False)):
             outputs = self.model(images=images)
 
-            # 获取材质和光照
-            materials = outputs.get('materials', {})
-            light_params = outputs.get('light_params', {})
+            # 获取材质 (模型直接输出各属性，需要收集成dict)
+            # 输出格式: (B, S, C, H, W) -> 需要转为 (B, S, H, W, C)
+            materials = {}
+            if 'diffuse' in outputs:
+                materials['diffuse'] = outputs['diffuse'].permute(0, 1, 3, 4, 2)  # (B, S, H, W, 3)
+            if 'specular' in outputs:
+                materials['specular'] = outputs['specular'].permute(0, 1, 3, 4, 2)
+            if 'roughness' in outputs:
+                materials['roughness'] = outputs['roughness'].permute(0, 1, 3, 4, 2)
+            if 'ambient_occlusion' in outputs:
+                materials['ao'] = outputs['ambient_occlusion'].permute(0, 1, 3, 4, 2)
+
+            # 获取光照参数
+            light_params = {}
+            if 'light_direction' in outputs:
+                light_params['light_direction'] = outputs['light_direction']  # (B, S, 3)
+            if 'light_intensity' in outputs:
+                light_params['light_intensity'] = outputs['light_intensity']  # (B, S, 1)
+            if 'light_color' in outputs:
+                light_params['light_color'] = outputs['light_color']  # (B, S, 3)
 
             # 获取深度和法线 (用于渲染)
-            depth = outputs.get('depth')  # (B, S, H, W)
+            depth = outputs.get('depth')  # (B, S, H, W, 1)
             normals = self._depth_to_normals(depth)  # (B, S, H, W, 3)
 
             # 渲染
@@ -268,6 +286,9 @@ class PhongTrainer:
                     ao=materials.get('ao'),
                     light_params=light_params,
                 )
+                # 数值安全: clamp渲染结果防止NaN (虚拟数据可能产生异常值)
+                rendered = torch.clamp(rendered, 0.0, 1.0)
+                rendered = torch.nan_to_num(rendered, nan=0.5, posinf=1.0, neginf=0.0)
             else:
                 # 如果没有材质或光照，使用简单渲染
                 rendered = images.permute(0, 1, 3, 4, 2)  # (B, S, H, W, C)
@@ -275,11 +296,17 @@ class PhongTrainer:
             # 准备目标图像
             target = images.permute(0, 1, 3, 4, 2)  # (B, S, H, W, C)
 
+            # 数值安全: 对材质也做NaN处理 (虚拟数据可能产生异常)
+            safe_materials = {}
+            for k, v in materials.items():
+                if v is not None:
+                    safe_materials[k] = torch.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0)
+
             # 计算损失
             loss_dict = self.loss_fn(
                 rendered_image=rendered,
                 target_image=target,
-                materials=materials,
+                materials=safe_materials,
             )
 
         # 反向传播
@@ -307,13 +334,17 @@ class PhongTrainer:
         从深度图计算法线 (简化版)
 
         Args:
-            depth: (B, S, H, W)
+            depth: (B, S, H, W, 1) 或 (B, S, H, W)
 
         Returns:
             normals: (B, S, H, W, 3)
         """
         if depth is None:
             return None
+
+        # 处理 (B, S, H, W, 1) 格式
+        if depth.dim() == 5:
+            depth = depth.squeeze(-1)  # (B, S, H, W)
 
         B, S, H, W = depth.shape
 

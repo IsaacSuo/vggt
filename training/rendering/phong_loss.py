@@ -142,7 +142,7 @@ class PhongLossWithRegularization(PhongLoss):
         材质平滑度损失: 鼓励相邻像素的材质相似
 
         Args:
-            materials: 包含diffuse, specular, roughness等
+            materials: 包含diffuse, specular, roughness等, shape (B, S, H, W, C)
 
         Returns:
             smoothness_loss: 标量
@@ -154,13 +154,13 @@ class PhongLossWithRegularization(PhongLoss):
             if key in materials and materials[key] is not None:
                 mat = materials[key]  # (B, S, H, W, C)
 
-                # 水平方向梯度
-                grad_h = torch.abs(mat[..., :-1, :] - mat[..., 1:, :])
-                total_loss += grad_h.mean()
-
-                # 垂直方向梯度
-                grad_w = torch.abs(mat[..., :, :-1] - mat[..., :, 1:])
+                # 水平方向梯度 (沿W维度)
+                grad_w = torch.abs(mat[:, :, :, :-1, :] - mat[:, :, :, 1:, :])
                 total_loss += grad_w.mean()
+
+                # 垂直方向梯度 (沿H维度)
+                grad_h = torch.abs(mat[:, :, :-1, :, :] - mat[:, :, 1:, :, :])
+                total_loss += grad_h.mean()
 
                 count += 2
 
