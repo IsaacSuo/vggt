@@ -123,6 +123,7 @@ class PhongLossWithRegularization(PhongLoss):
     额外的正则化项:
     1. 材质平滑度: 相邻像素的材质应该相似
     2. 物理约束: diffuse + specular ≤ 1 (能量守恒)
+    3. 法线一致性: 预测法线与深度导出法线的一致性
     """
 
     def __init__(
@@ -130,12 +131,14 @@ class PhongLossWithRegularization(PhongLoss):
         weight: float = 0.1,
         material_smoothness_weight: float = 0.01,
         energy_conservation_weight: float = 0.01,
+        normal_consistency_weight: float = 0.1,
         **kwargs
     ):
         super().__init__(weight=weight, **kwargs)
 
         self.material_smoothness_weight = material_smoothness_weight
         self.energy_conservation_weight = energy_conservation_weight
+        self.normal_consistency_weight = normal_consistency_weight
 
     def compute_material_smoothness_loss(self, materials: dict) -> torch.Tensor:
         """
@@ -190,12 +193,89 @@ class PhongLossWithRegularization(PhongLoss):
 
         return violation.mean()
 
+    def depth_to_normals(self, depth: torch.Tensor) -> torch.Tensor:
+        """
+        从深度图计算法线
+
+        Args:
+            depth: (B, S, H, W) 或 (B, S, H, W, 1) 深度图
+
+        Returns:
+            normals: (B, S, H, W, 3) 单位法向量
+        """
+        # 处理 (B, S, H, W, 1) 格式
+        if depth.dim() == 5:
+            depth = depth.squeeze(-1)
+
+        B, S, H, W = depth.shape
+
+        # 使用Sobel算子计算梯度
+        depth_padded = F.pad(depth, (1, 1, 1, 1), mode='replicate')
+
+        # 计算梯度
+        dz_dx = (depth_padded[:, :, 1:-1, 2:] - depth_padded[:, :, 1:-1, :-2]) / 2.0
+        dz_dy = (depth_padded[:, :, 2:, 1:-1] - depth_padded[:, :, :-2, 1:-1]) / 2.0
+
+        # 构建法线 (相机坐标系: z朝外)
+        normals = torch.stack([
+            -dz_dx,
+            -dz_dy,
+            torch.ones_like(dz_dx),
+        ], dim=-1)
+
+        # 归一化
+        normals = F.normalize(normals, p=2, dim=-1, eps=1e-6)
+
+        return normals
+
+    def compute_normal_consistency_loss(
+        self,
+        predicted_normals: torch.Tensor,
+        depth: torch.Tensor,
+        depth_conf: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        计算法线一致性损失
+
+        使用余弦距离: 1 - cos(predicted, depth_derived)
+
+        Args:
+            predicted_normals: (B, S, H, W, 3) 预测的法线
+            depth: (B, S, H, W) 或 (B, S, H, W, 1) 深度图
+            depth_conf: (B, S, H, W) 深度置信度 (可选，用于加权)
+
+        Returns:
+            consistency_loss: 标量
+        """
+        if depth is None or predicted_normals is None:
+            return torch.tensor(0.0, device=predicted_normals.device if predicted_normals is not None else 'cpu')
+
+        # 从深度计算法线
+        depth_normals = self.depth_to_normals(depth)
+
+        # 余弦相似度: dot(n1, n2) for unit vectors
+        cosine_sim = (predicted_normals * depth_normals).sum(dim=-1)  # (B, S, H, W)
+
+        # 余弦距离: 1 - cos
+        cosine_dist = 1.0 - cosine_sim
+
+        # 如果有深度置信度，使用它加权
+        if depth_conf is not None:
+            # 归一化置信度
+            conf_weight = depth_conf / (depth_conf.mean() + 1e-6)
+            cosine_dist = cosine_dist * conf_weight
+
+        return cosine_dist.mean()
+
     def forward(
         self,
         rendered_image: torch.Tensor,
         target_image: torch.Tensor,
         materials: dict = None,
-        mask: torch.Tensor = None
+        mask: torch.Tensor = None,
+        predicted_normals: torch.Tensor = None,
+        depth: torch.Tensor = None,
+        depth_conf: torch.Tensor = None,
     ) -> dict:
         """
         计算总损失 (包含正则化)
@@ -205,6 +285,9 @@ class PhongLossWithRegularization(PhongLoss):
             target_image: (B, S, H, W, 3)
             materials: 材质字典 (用于正则化)
             mask: (B, S, H, W, 1)
+            predicted_normals: (B, S, H, W, 3) 预测的法线
+            depth: (B, S, H, W) 或 (B, S, H, W, 1) 深度图
+            depth_conf: (B, S, H, W) 深度置信度
 
         Returns:
             loss_dict: 包含各项损失的字典
@@ -222,13 +305,19 @@ class PhongLossWithRegularization(PhongLoss):
         if materials is not None and self.material_smoothness_weight > 0:
             smoothness_loss = self.compute_material_smoothness_loss(materials)
             loss_dict['loss_phong_smoothness'] = smoothness_loss
-            total_loss += smoothness_loss * self.material_smoothness_weight
+            total_loss = total_loss + smoothness_loss * self.material_smoothness_weight
 
         # 能量守恒约束
         if materials is not None and self.energy_conservation_weight > 0:
             energy_loss = self.compute_energy_conservation_loss(materials)
             loss_dict['loss_phong_energy'] = energy_loss
-            total_loss += energy_loss * self.energy_conservation_weight
+            total_loss = total_loss + energy_loss * self.energy_conservation_weight
+
+        # 法线一致性约束
+        if predicted_normals is not None and depth is not None and self.normal_consistency_weight > 0:
+            normal_loss = self.compute_normal_consistency_loss(predicted_normals, depth, depth_conf)
+            loss_dict['loss_phong_normal_consistency'] = normal_loss
+            total_loss = total_loss + normal_loss * self.normal_consistency_weight
 
         # 应用总权重
         loss_dict['loss_phong_total'] = total_loss * self.weight

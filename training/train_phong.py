@@ -87,6 +87,7 @@ class PhongTrainer:
         self.model = VGGT(
             enable_material=True,
             enable_light=True,
+            enable_normal=True,
         )
 
         # 加载预训练权重
@@ -111,10 +112,10 @@ class PhongTrainer:
                 state_dict = pretrained_model.state_dict()
                 del pretrained_model  # 释放内存
 
-            # 过滤掉新head的权重 (material_head, light_head)
+            # 过滤掉新head的权重 (material_head, light_head, normal_head)
             state_dict_filtered = {
                 k: v for k, v in state_dict.items()
-                if not k.startswith(('material_head', 'light_head'))
+                if not k.startswith(('material_head', 'light_head', 'normal_head'))
             }
 
             # 加载权重 (strict=False 允许新增head的权重缺失)
@@ -161,6 +162,7 @@ class PhongTrainer:
         modules = {
             'material_head': getattr(self.model, 'material_head', None),
             'light_head': getattr(self.model, 'light_head', None),
+            'normal_head': getattr(self.model, 'normal_head', None),
         }
 
         for name, module in modules.items():
@@ -187,6 +189,7 @@ class PhongTrainer:
             photometric_loss_type=loss_config.get('photometric_type', 'l1'),
             material_smoothness_weight=loss_config.get('smoothness_weight', 0.01),
             energy_conservation_weight=loss_config.get('energy_weight', 0.01),
+            normal_consistency_weight=loss_config.get('normal_consistency_weight', 0.1),
         )
         print("[PhongTrainer] Loss function initialized")
 
@@ -284,12 +287,15 @@ class PhongTrainer:
             if 'light_color' in outputs:
                 light_params['light_color'] = outputs['light_color']  # (B, S, 3)
 
-            # 获取深度和法线 (用于渲染)
+            # 获取深度和置信度 (用于法线一致性约束)
             depth = outputs.get('depth')  # (B, S, H, W, 1)
-            normals = self._depth_to_normals(depth)  # (B, S, H, W, 3)
+            depth_conf = outputs.get('depth_conf')  # (B, S, H, W)
+
+            # 获取预测的法线 (直接从NormalHead预测，而非从深度计算)
+            normals = outputs.get('normals')  # (B, S, H, W, 3)
 
             # 渲染
-            if materials and light_params:
+            if materials and light_params and normals is not None:
                 rendered = self.renderer.phong_shading(
                     normals=normals,
                     diffuse=materials.get('diffuse'),
@@ -314,11 +320,20 @@ class PhongTrainer:
                 if v is not None:
                     safe_materials[k] = torch.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0)
 
-            # 计算损失
+            # 对法线也做NaN处理
+            safe_normals = None
+            if normals is not None:
+                safe_normals = torch.nan_to_num(normals, nan=0.0, posinf=1.0, neginf=-1.0)
+                safe_normals = torch.nn.functional.normalize(safe_normals, p=2, dim=-1, eps=1e-6)
+
+            # 计算损失 (包含法线一致性约束)
             loss_dict = self.loss_fn(
                 rendered_image=rendered,
                 target_image=target,
                 materials=safe_materials,
+                predicted_normals=safe_normals,
+                depth=depth,
+                depth_conf=depth_conf,
             )
 
         # 反向传播

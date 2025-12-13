@@ -28,7 +28,8 @@
     "weight": 1.0,
     "photometric_type": "l1",
     "smoothness_weight": 0.01,
-    "energy_weight": 0.01
+    "energy_weight": 0.01,
+    "normal_consistency_weight": 0.1
   },
 
   "optimizer": {
