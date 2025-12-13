@@ -35,6 +35,7 @@ from vggt.models.vggt import VGGT
 from training.rendering.phong_renderer import SimplePhongRenderer
 from training.rendering.phong_loss import PhongLossWithRegularization
 from training.monitoring.phong_monitor import PhongTrainingMonitor, VisualizationSaver, create_training_summary
+from training.data.datasets.openmaterial import OpenMaterialDataset
 
 
 class PhongTrainer:
@@ -70,6 +71,7 @@ class PhongTrainer:
         self.epoch = 0
         self.global_step = 0
         self.best_loss = float('inf')
+        self.depth_unfrozen = False  # 两阶段训练: depth_head是否已解冻
 
         print(f"[PhongTrainer] Initialized. Logs at: {self.log_dir}")
 
@@ -171,6 +173,62 @@ class PhongTrainer:
                 trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
                 print(f"[PhongTrainer] {name}: {total/1e6:.2f}M total, {trainable/1e6:.2f}M trainable")
 
+    def _unfreeze_depth_head(self):
+        """
+        解冻depth_head用于阶段二微调
+
+        使用更小的学习率以保护预训练知识
+        """
+        if self.model.depth_head is None:
+            print("[PhongTrainer] Warning: depth_head is None, cannot unfreeze")
+            return
+
+        if self.depth_unfrozen:
+            return  # 已经解冻过了
+
+        two_stage_config = self.config.get('two_stage_training', {})
+        depth_lr_ratio = two_stage_config.get('depth_lr_ratio', 0.1)
+        base_lr = self.config.get('optimizer', {}).get('lr', 1e-4)
+        depth_lr = base_lr * depth_lr_ratio
+
+        # 解冻depth_head参数
+        unfrozen_count = 0
+        for name, param in self.model.depth_head.named_parameters():
+            param.requires_grad = True
+            unfrozen_count += param.numel()
+
+        print(f"[PhongTrainer] ====== Stage 2: Unfreeze depth_head ======")
+        print(f"[PhongTrainer] Unfrozen {unfrozen_count/1e6:.2f}M depth_head params")
+        print(f"[PhongTrainer] Depth LR: {depth_lr:.2e} (ratio={depth_lr_ratio})")
+
+        # 将depth_head参数加入optimizer，使用更小的学习率
+        depth_params = list(self.model.depth_head.parameters())
+        self.optimizer.add_param_group({
+            'params': depth_params,
+            'lr': depth_lr,
+            'name': 'depth_head'
+        })
+
+        self.depth_unfrozen = True
+        print(f"[PhongTrainer] ========================================")
+
+    def _maybe_unfreeze_depth(self):
+        """
+        检查是否应该解冻depth_head (两阶段训练)
+        """
+        two_stage_config = self.config.get('two_stage_training', {})
+
+        if not two_stage_config.get('enabled', False):
+            return
+
+        if self.depth_unfrozen:
+            return
+
+        unfreeze_step = two_stage_config.get('unfreeze_depth_at_step', 5000)
+
+        if self.global_step >= unfreeze_step:
+            self._unfreeze_depth_head()
+
     def _setup_renderer(self):
         """初始化渲染器"""
         renderer_config = self.config.get('renderer', {})
@@ -190,6 +248,7 @@ class PhongTrainer:
             material_smoothness_weight=loss_config.get('smoothness_weight', 0.01),
             energy_conservation_weight=loss_config.get('energy_weight', 0.01),
             normal_consistency_weight=loss_config.get('normal_consistency_weight', 0.1),
+            depth_supervision_weight=loss_config.get('depth_supervision_weight', 0.5),
         )
         print("[PhongTrainer] Loss function initialized")
 
@@ -251,16 +310,28 @@ class PhongTrainer:
         单步训练
 
         Args:
-            batch: 包含 'images' 的数据字典
+            batch: 包含 'images', 'depths' (可选), 'masks' (可选) 的数据字典
 
         Returns:
             loss_dict: 损失字典
         """
+        # 检查是否需要解冻depth_head (两阶段训练)
+        self._maybe_unfreeze_depth()
+
         self.model.train()
         self.optimizer.zero_grad()
 
         # 获取输入
         images = batch['images'].to(self.device)  # (B, S, C, H, W)
+
+        # 获取GT深度和mask (可选)
+        gt_depth = batch.get('depths')  # (B, S, H, W) 或 None
+        masks = batch.get('masks')  # (B, S, H, W) 或 None
+
+        if gt_depth is not None:
+            gt_depth = gt_depth.to(self.device)
+        if masks is not None:
+            masks = masks.to(self.device).unsqueeze(-1)  # (B, S, H, W, 1)
 
         # 前向传播
         with torch.cuda.amp.autocast(enabled=self.config.get('use_amp', False)):
@@ -326,14 +397,16 @@ class PhongTrainer:
                 safe_normals = torch.nan_to_num(normals, nan=0.0, posinf=1.0, neginf=-1.0)
                 safe_normals = torch.nn.functional.normalize(safe_normals, p=2, dim=-1, eps=1e-6)
 
-            # 计算损失 (包含法线一致性约束)
+            # 计算损失 (包含法线一致性约束和深度监督)
             loss_dict = self.loss_fn(
                 rendered_image=rendered,
                 target_image=target,
                 materials=safe_materials,
+                mask=masks,
                 predicted_normals=safe_normals,
                 depth=depth,
                 depth_conf=depth_conf,
+                gt_depth=gt_depth,
             )
 
         # 反向传播
@@ -510,6 +583,7 @@ class PhongTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_loss': self.best_loss,
             'config': self.config,
+            'depth_unfrozen': self.depth_unfrozen,  # 两阶段训练状态
         }
 
         if self.scheduler:
@@ -536,6 +610,14 @@ class PhongTrainer:
 
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # 恢复两阶段训练状态
+        self.depth_unfrozen = checkpoint.get('depth_unfrozen', False)
+        if self.depth_unfrozen and self.model.depth_head is not None:
+            # 重新解冻depth_head参数 (optimizer状态已从checkpoint恢复)
+            for param in self.model.depth_head.parameters():
+                param.requires_grad = True
+            print(f"[PhongTrainer] Restored depth_unfrozen=True, depth_head is trainable")
 
         print(f"[PhongTrainer] Resumed from epoch {self.epoch}, step {self.global_step}")
 
@@ -571,6 +653,55 @@ def create_dummy_dataloader(batch_size: int = 2, num_samples: int = 100):
     return dataloader
 
 
+def create_openmaterial_dataloader(
+    data_dir: str,
+    depth_dir: str = None,
+    scene_ids: list = None,
+    split: str = "train",
+    batch_size: int = 2,
+    num_workers: int = 4,
+    img_size: int = 518,
+    num_views: int = 4,
+):
+    """
+    创建OpenMaterial数据加载器
+
+    Args:
+        data_dir: OpenMaterial数据目录
+        depth_dir: 预渲染深度图目录 (可选)
+        scene_ids: 场景ID列表 (如果为None，自动发现)
+        split: "train" 或 "test"
+        batch_size: 批大小
+        num_workers: 数据加载线程数
+        img_size: 图像尺寸
+        num_views: 每个样本的视图数
+
+    Returns:
+        DataLoader
+    """
+    dataset = OpenMaterialDataset(
+        data_dir=data_dir,
+        depth_dir=depth_dir,
+        scene_ids=scene_ids,
+        split=split,
+        img_size=img_size,
+        num_views=num_views,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    print(f"[DataLoader] Created OpenMaterial dataloader: {len(dataset)} samples, {len(dataloader)} batches")
+
+    return dataloader
+
+
 def main():
     parser = argparse.ArgumentParser(description='Phong Training')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
@@ -581,6 +712,10 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--log_dir', type=str, default='./phong_training_logs', help='Log directory')
     parser.add_argument('--experiment_name', type=str, default=None, help='Experiment name')
+    # 数据相关参数
+    parser.add_argument('--data_dir', type=str, default=None, help='OpenMaterial data directory')
+    parser.add_argument('--depth_dir', type=str, default=None, help='Pre-rendered depth directory')
+    parser.add_argument('--use_dummy_data', action='store_true', help='Use dummy data for testing')
     args = parser.parse_args()
 
     # 加载或创建配置
@@ -607,9 +742,26 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    # 创建数据加载器 (这里使用虚拟数据，实际应使用真实数据集)
-    print("[Main] Creating dataloader (dummy data for testing)...")
-    dataloader = create_dummy_dataloader(batch_size=args.batch_size)
+    # 创建数据加载器
+    data_config = config.get('data', {})
+    data_dir = args.data_dir or data_config.get('data_dir')
+    depth_dir = args.depth_dir or data_config.get('depth_dir')
+
+    if args.use_dummy_data or data_dir is None:
+        print("[Main] Creating dataloader (dummy data for testing)...")
+        dataloader = create_dummy_dataloader(batch_size=args.batch_size)
+    else:
+        print(f"[Main] Creating OpenMaterial dataloader from: {data_dir}")
+        dataloader = create_openmaterial_dataloader(
+            data_dir=data_dir,
+            depth_dir=depth_dir,
+            scene_ids=data_config.get('scene_ids'),
+            split=data_config.get('split', 'train'),
+            batch_size=args.batch_size,
+            num_workers=data_config.get('num_workers', 4),
+            img_size=data_config.get('img_size', 518),
+            num_views=data_config.get('num_views', 4),
+        )
 
     # 训练循环
     print(f"[Main] Starting training for {config['max_epochs']} epochs...")

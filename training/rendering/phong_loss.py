@@ -124,6 +124,7 @@ class PhongLossWithRegularization(PhongLoss):
     1. 材质平滑度: 相邻像素的材质应该相似
     2. 物理约束: diffuse + specular ≤ 1 (能量守恒)
     3. 法线一致性: 预测法线与深度导出法线的一致性
+    4. 深度监督: 预测深度与GT深度的一致性 (需要GT深度)
     """
 
     def __init__(
@@ -132,6 +133,7 @@ class PhongLossWithRegularization(PhongLoss):
         material_smoothness_weight: float = 0.01,
         energy_conservation_weight: float = 0.01,
         normal_consistency_weight: float = 0.1,
+        depth_supervision_weight: float = 0.5,
         **kwargs
     ):
         super().__init__(weight=weight, **kwargs)
@@ -139,6 +141,7 @@ class PhongLossWithRegularization(PhongLoss):
         self.material_smoothness_weight = material_smoothness_weight
         self.energy_conservation_weight = energy_conservation_weight
         self.normal_consistency_weight = normal_consistency_weight
+        self.depth_supervision_weight = depth_supervision_weight
 
     def compute_material_smoothness_loss(self, materials: dict) -> torch.Tensor:
         """
@@ -228,6 +231,43 @@ class PhongLossWithRegularization(PhongLoss):
 
         return normals
 
+    def compute_depth_supervision_loss(
+        self,
+        pred_depth: torch.Tensor,
+        gt_depth: torch.Tensor,
+        mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        深度监督损失: 预测深度与GT深度的L1误差
+
+        Args:
+            pred_depth: (B, S, H, W) 或 (B, S, H, W, 1) 预测深度
+            gt_depth: (B, S, H, W) 或 (B, S, H, W, 1) GT深度
+            mask: (B, S, H, W) 或 (B, S, H, W, 1) 有效像素mask
+
+        Returns:
+            depth_loss: 标量
+        """
+        # 处理维度
+        if pred_depth.dim() == 5:
+            pred_depth = pred_depth.squeeze(-1)
+        if gt_depth.dim() == 5:
+            gt_depth = gt_depth.squeeze(-1)
+        if mask is not None and mask.dim() == 5:
+            mask = mask.squeeze(-1)
+
+        # L1 损失
+        loss = torch.abs(pred_depth - gt_depth)
+
+        # 应用mask (只在有效区域计算)
+        if mask is not None:
+            loss = loss * mask
+            loss = loss.sum() / (mask.sum() + 1e-6)
+        else:
+            loss = loss.mean()
+
+        return loss
+
     def compute_normal_consistency_loss(
         self,
         predicted_normals: torch.Tensor,
@@ -276,6 +316,7 @@ class PhongLossWithRegularization(PhongLoss):
         predicted_normals: torch.Tensor = None,
         depth: torch.Tensor = None,
         depth_conf: torch.Tensor = None,
+        gt_depth: torch.Tensor = None,
     ) -> dict:
         """
         计算总损失 (包含正则化)
@@ -286,8 +327,9 @@ class PhongLossWithRegularization(PhongLoss):
             materials: 材质字典 (用于正则化)
             mask: (B, S, H, W, 1)
             predicted_normals: (B, S, H, W, 3) 预测的法线
-            depth: (B, S, H, W) 或 (B, S, H, W, 1) 深度图
+            depth: (B, S, H, W) 或 (B, S, H, W, 1) 预测深度图
             depth_conf: (B, S, H, W) 深度置信度
+            gt_depth: (B, S, H, W) 或 (B, S, H, W, 1) GT深度图
 
         Returns:
             loss_dict: 包含各项损失的字典
@@ -318,6 +360,20 @@ class PhongLossWithRegularization(PhongLoss):
             normal_loss = self.compute_normal_consistency_loss(predicted_normals, depth, depth_conf)
             loss_dict['loss_phong_normal_consistency'] = normal_loss
             total_loss = total_loss + normal_loss * self.normal_consistency_weight
+
+        # 深度监督损失 (GT深度)
+        if gt_depth is not None and depth is not None and self.depth_supervision_weight > 0:
+            # 创建有效深度mask (排除无效区域，如max_depth位置)
+            depth_mask = (gt_depth < 90.0).float() if gt_depth.dim() == 4 else (gt_depth.squeeze(-1) < 90.0).float()
+            if mask is not None:
+                # 结合物体mask
+                combined_mask = depth_mask * (mask.squeeze(-1) if mask.dim() == 5 else mask)
+            else:
+                combined_mask = depth_mask
+
+            depth_loss = self.compute_depth_supervision_loss(depth, gt_depth, combined_mask)
+            loss_dict['loss_phong_depth'] = depth_loss
+            total_loss = total_loss + depth_loss * self.depth_supervision_weight
 
         # 应用总权重
         loss_dict['loss_phong_total'] = total_loss * self.weight

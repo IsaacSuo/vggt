@@ -19,6 +19,12 @@
     "depth_head"
   ],
 
+  "two_stage_training": {
+    "enabled": true,
+    "unfreeze_depth_at_step": 5000,
+    "depth_lr_ratio": 0.1
+  },
+
   "renderer": {
     "ambient_strength": 0.3,
     "use_learnable_light": true
@@ -29,7 +35,8 @@
     "photometric_type": "l1",
     "smoothness_weight": 0.01,
     "energy_weight": 0.01,
-    "normal_consistency_weight": 0.1
+    "normal_consistency_weight": 0.1,
+    "depth_supervision_weight": 0.5
   },
 
   "optimizer": {
@@ -51,8 +58,13 @@
   },
 
   "data": {
+    "data_dir": null,
+    "depth_dir": null,
+    "scene_ids": null,
+    "split": "train",
     "batch_size": 2,
     "num_workers": 4,
-    "image_size": [518, 518]
+    "img_size": 518,
+    "num_views": 4
   }
 }
