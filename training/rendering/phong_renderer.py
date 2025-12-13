@@ -5,13 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-SimplePhongRenderer: 简单但稳健的Phong光照渲染器
+SimplePhongRenderer: 可微分Phong光照渲染器
 
 特点:
-1. 假设光源在相机位置 (Flashlight effect) - 对单目重建最稳健
+1. 支持可学习的光照方向（每张图像独立预测）
 2. 从深度图计算法线
-3. 实现 Diffuse + Specular 着色
-4. 完全可微分
+3. 实现 Ambient + Diffuse + Specular 着色
+4. 完全可微分，支持端到端训练
 """
 
 import torch
@@ -21,30 +21,36 @@ import torch.nn.functional as F
 
 class SimplePhongRenderer(nn.Module):
     """
-    简单的可微Phong渲染器
+    可微分Phong渲染器，支持可学习光照
 
-    假设:
-    - 光源位置与相机重合 (co-located light)
-    - 视线方向沿着Z轴正方向 [0, 0, 1]
-    - 这样的设置对单目重建最为稳健
+    特点:
+    - 支持per-image光照方向（由LightHead预测）
+    - 视线方向固定沿着Z轴正方向 [0, 0, 1]（相机朝向）
+    - 光照方向可学习，从图像特征推断真实光源位置
     """
 
     def __init__(
         self,
-        light_intensity: float = 1.0,
         ambient_strength: float = 0.3,
+        use_learnable_light: bool = True,
     ):
+        """
+        Args:
+            ambient_strength: 环境光强度系数
+            use_learnable_light: 是否使用可学习光照（True: 从light_params读取, False: 使用固定默认值）
+        """
         super().__init__()
 
-        self.light_intensity = light_intensity
         self.ambient_strength = ambient_strength
+        self.use_learnable_light = use_learnable_light
 
-        # 光源颜色 (白光)
-        self.register_buffer('light_color', torch.tensor([1.0, 1.0, 1.0]))
-
-        # 视线方向和光线方向 (都指向相机)
+        # 视线方向（固定：相机朝向）
         self.register_buffer('view_dir', torch.tensor([0.0, 0.0, 1.0]))
-        self.register_buffer('light_dir', torch.tensor([0.0, 0.0, 1.0]))
+
+        # 默认光照参数（当use_learnable_light=False或light_params未提供时使用）
+        self.register_buffer('default_light_dir', torch.tensor([0.3, -0.5, 0.8]))  # 斜上方光源
+        self.register_buffer('default_light_color', torch.tensor([1.0, 1.0, 1.0]))  # 白光
+        self.default_light_intensity = 1.0
 
     def depth_to_normals(self, depth: torch.Tensor, intrinsics: torch.Tensor = None) -> torch.Tensor:
         """
@@ -97,6 +103,7 @@ class SimplePhongRenderer(nn.Module):
         specular: torch.Tensor,
         roughness: torch.Tensor,
         ao: torch.Tensor = None,
+        light_params: dict = None,
     ) -> torch.Tensor:
         """
         Phong着色模型
@@ -109,11 +116,34 @@ class SimplePhongRenderer(nn.Module):
             specular: (B, S, H, W, 3) 镜面反射系数
             roughness: (B, S, H, W, 1) 粗糙度
             ao: (B, S, H, W, 1) 环境光遮蔽 (可选)
+            light_params: dict 光照参数 (可选), 包含:
+                - 'light_direction': (B, S, 3) 光照方向
+                - 'light_intensity': (B, S, 1) 光照强度
+                - 'light_color': (B, S, 3) 光源颜色
+                如果为None，使用默认参数
 
         Returns:
             shaded_color: (B, S, H, W, 3) 着色后的颜色
         """
         B, S, H, W, _ = normals.shape
+
+        # 解析光照参数
+        if light_params is not None and self.use_learnable_light:
+            # 使用预测的光照参数
+            light_dir_base = light_params['light_direction']  # (B, S, 3)
+            light_intensity_base = light_params['light_intensity']  # (B, S, 1)
+            light_color_base = light_params['light_color']  # (B, S, 3)
+
+            # Expand to (B, S, H, W, 3/1)
+            light_dir = light_dir_base.unsqueeze(2).unsqueeze(3).expand(B, S, H, W, 3)
+            light_intensity = light_intensity_base.unsqueeze(2).unsqueeze(3).expand(B, S, H, W, 1)
+            light_color = light_color_base.unsqueeze(2).unsqueeze(3).expand(B, S, H, W, 3)
+        else:
+            # 使用默认光照参数
+            light_dir = self.default_light_dir.view(1, 1, 1, 1, 3).expand(B, S, H, W, 3)
+            light_intensity = torch.full((B, S, H, W, 1), self.default_light_intensity,
+                                        device=normals.device, dtype=normals.dtype)
+            light_color = self.default_light_color.view(1, 1, 1, 1, 3).expand(B, S, H, W, 3)
 
         # 1. Ambient 分量 (环境光)
         if ao is not None:
@@ -123,11 +153,10 @@ class SimplePhongRenderer(nn.Module):
 
         # 2. Diffuse 分量 (Lambertian 漫反射)
         # N · L (法向量与光线方向的点积)
-        light_dir = self.light_dir.view(1, 1, 1, 1, 3).expand(B, S, H, W, 3)
         n_dot_l = torch.sum(normals * light_dir, dim=-1, keepdim=True)  # (B, S, H, W, 1)
         n_dot_l = torch.clamp(n_dot_l, min=0.0)  # 只保留正值（面向光源的部分）
 
-        diffuse_shading = diffuse * n_dot_l * self.light_intensity
+        diffuse_shading = diffuse * n_dot_l * light_intensity * light_color
 
         # 3. Specular 分量 (Blinn-Phong 高光)
         # 计算半角向量 H = normalize(L + V)
@@ -144,7 +173,7 @@ class SimplePhongRenderer(nn.Module):
         shininess = (1.0 - roughness.clamp(0.01, 0.99)) * 99.0 + 1.0
 
         # 高光项
-        specular_shading = specular * torch.pow(n_dot_h + 1e-6, shininess) * self.light_intensity
+        specular_shading = specular * torch.pow(n_dot_h + 1e-6, shininess) * light_intensity * light_color
 
         # 只在被光照到的区域有高光 (n_dot_l > 0)
         specular_shading = specular_shading * (n_dot_l > 0).float()
@@ -161,6 +190,7 @@ class SimplePhongRenderer(nn.Module):
         self,
         depth: torch.Tensor,
         materials: dict,
+        light_params: dict = None,
         intrinsics: torch.Tensor = None,
     ) -> tuple:
         """
@@ -173,6 +203,10 @@ class SimplePhongRenderer(nn.Module):
                 - 'specular': (B, S, H, W, 3) 镜面反射颜色
                 - 'roughness': (B, S, H, W, 1) 粗糙度
                 - 'ambient_occlusion': (B, S, H, W, 1) 环境光遮蔽 (可选)
+            light_params: 光照参数字典 (可选):
+                - 'light_direction': (B, S, 3) 光照方向
+                - 'light_intensity': (B, S, 1) 光照强度
+                - 'light_color': (B, S, 3) 光源颜色
             intrinsics: (B, S, 3, 3) 相机内参 (当前版本暂不使用)
 
         Returns:
@@ -188,13 +222,14 @@ class SimplePhongRenderer(nn.Module):
         roughness = materials['roughness']
         ao = materials.get('ambient_occlusion', None)
 
-        # 3. 执行Phong着色
+        # 3. 执行Phong着色（传入light_params）
         rendered_image = self.phong_shading(
             normals=normals,
             diffuse=diffuse,
             specular=specular,
             roughness=roughness,
             ao=ao,
+            light_params=light_params,  # 传递光照参数
         )
 
         return rendered_image, normals
@@ -215,19 +250,22 @@ class SimplePhongRendererWithMask(SimplePhongRenderer):
         depth: torch.Tensor,
         materials: dict,
         mask: torch.Tensor = None,
+        light_params: dict = None,
         intrinsics: torch.Tensor = None,
     ) -> tuple:
         """
         Args:
             mask: (B, S, H, W) 有效像素mask (1=有效, 0=无效)
+            light_params: 光照参数字典（与父类相同）
+            其他参数见父类
 
         Returns:
             rendered_image: (B, S, H, W, 3)
             normals: (B, S, H, W, 3)
             mask: (B, S, H, W, 1) 扩展到与图像相同的维度
         """
-        # 调用父类的渲染
-        rendered_image, normals = super().forward(depth, materials, intrinsics)
+        # 调用父类的渲染（传递light_params）
+        rendered_image, normals = super().forward(depth, materials, light_params, intrinsics)
 
         # 应用mask
         if mask is not None:

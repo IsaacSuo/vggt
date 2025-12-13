@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-PBR Loss: 基于物理渲染的损失函数
+Phong Loss: 基于物理渲染的损失函数
 """
 
 import torch
@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PBRLoss(nn.Module):
+class PhongLoss(nn.Module):
     """
     基于物理渲染的损失函数
 
@@ -116,9 +116,9 @@ class PBRLoss(nn.Module):
         return total_loss
 
 
-class PBRLossWithRegularization(PBRLoss):
+class PhongLossWithRegularization(PhongLoss):
     """
-    带正则化的PBR损失
+    带正则化的Phong损失
 
     额外的正则化项:
     1. 材质平滑度: 相邻像素的材质应该相似
@@ -213,7 +213,7 @@ class PBRLossWithRegularization(PBRLoss):
         photometric_loss = self.compute_photometric_loss(rendered_image, target_image, mask)
 
         loss_dict = {
-            'loss_pbr_photometric': photometric_loss,
+            'loss_phong_photometric': photometric_loss,
         }
 
         total_loss = photometric_loss
@@ -221,16 +221,16 @@ class PBRLossWithRegularization(PBRLoss):
         # 材质平滑度正则化
         if materials is not None and self.material_smoothness_weight > 0:
             smoothness_loss = self.compute_material_smoothness_loss(materials)
-            loss_dict['loss_pbr_smoothness'] = smoothness_loss
+            loss_dict['loss_phong_smoothness'] = smoothness_loss
             total_loss += smoothness_loss * self.material_smoothness_weight
 
         # 能量守恒约束
         if materials is not None and self.energy_conservation_weight > 0:
             energy_loss = self.compute_energy_conservation_loss(materials)
-            loss_dict['loss_pbr_energy'] = energy_loss
+            loss_dict['loss_phong_energy'] = energy_loss
             total_loss += energy_loss * self.energy_conservation_weight
 
         # 应用总权重
-        loss_dict['loss_pbr_total'] = total_loss * self.weight
+        loss_dict['loss_phong_total'] = total_loss * self.weight
 
         return loss_dict

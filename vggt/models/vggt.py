@@ -13,11 +13,13 @@ from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
 from vggt.heads.material_head import MaterialHead
+from vggt.heads.light_head import LightHead
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
-                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True, enable_material=False):
+                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
+                 enable_material=False, enable_light=False):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -33,6 +35,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             self.material_head = MaterialHead(dim_in=2 * embed_dim, patch_size=patch_size)
         else:
             self.material_head = None
+
+        # Light prediction head for learnable lighting
+        if enable_light:
+            print("💡 Initializing Light Head for learnable lighting...")
+            self.light_head = LightHead(dim_in=2 * embed_dim, hidden_dim=512)
+        else:
+            self.light_head = None
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         """
@@ -96,6 +105,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
                 )
                 predictions.update(materials)
+
+            # Light prediction for learnable lighting
+            if self.light_head is not None:
+                light_params = self.light_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                )
+                predictions.update(light_params)
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
