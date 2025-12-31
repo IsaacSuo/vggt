@@ -32,7 +32,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
     def enable_lora(
         self,
-        rank: int = 32,
+        config_or_rank: "int | LoRAConfig" = 32,
         alpha: float = 32.0,
         dropout: float = 0.0,
         target_modules: Optional[List[str]] = None,
@@ -44,9 +44,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         Enable LoRA fine-tuning for the model.
 
         Args:
-            rank: Rank of the LoRA matrices
-            alpha: Scaling factor for LoRA
-            dropout: Dropout probability for LoRA path
+            config_or_rank: Either a LoRAConfig object or the rank of LoRA matrices
+            alpha: Scaling factor for LoRA (ignored if config_or_rank is LoRAConfig)
+            dropout: Dropout probability (ignored if config_or_rank is LoRAConfig)
             target_modules: Which modules to apply LoRA to (default: ["qkv"])
             target_block_type: "global", "frame", or "both"
             block_indices: Specific block indices to target (None = all)
@@ -57,15 +57,18 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         """
         from vggt.lora import LoRAConfig, inject_lora_to_model, freeze_base_model
 
-        if target_modules is None:
-            target_modules = ["qkv"]
-
-        config = LoRAConfig(
-            rank=rank,
-            alpha=alpha,
-            dropout=dropout,
-            target_modules=target_modules,
-        )
+        # Support both LoRAConfig object and individual parameters
+        if isinstance(config_or_rank, LoRAConfig):
+            config = config_or_rank
+        else:
+            if target_modules is None:
+                target_modules = ["qkv"]
+            config = LoRAConfig(
+                rank=config_or_rank,
+                alpha=alpha,
+                dropout=dropout,
+                target_modules=target_modules,
+            )
 
         inject_lora_to_model(
             self,
