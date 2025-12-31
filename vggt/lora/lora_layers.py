@@ -71,6 +71,8 @@ class LoRALinear(nn.Module):
 
         in_features = original_layer.in_features
         out_features = original_layer.out_features
+        device = original_layer.weight.device
+        dtype = original_layer.weight.dtype
 
         # Freeze original layer
         for param in self.original_layer.parameters():
@@ -79,8 +81,8 @@ class LoRALinear(nn.Module):
         # LoRA matrices
         # A: down-projection, initialized with Kaiming uniform
         # B: up-projection, initialized with zeros (so LoRA starts as identity)
-        self.lora_A = nn.Linear(in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.lora_A = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
+        self.lora_B = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
 
         # Initialize
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
