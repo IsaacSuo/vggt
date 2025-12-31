@@ -1,0 +1,220 @@
+# LoRA Fine-tuning Configuration for Visual-Hull-Aware VGGT
+#
+# This config is designed for fine-tuning VGGT with LoRA on custom data
+# with mask-guided attention for reflective/specular objects.
+
+defaults:
+  - default_dataset.yaml
+
+exp_name: lora_visual_hull
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 1
+patch_size: 14
+val_epoch_freq: 2
+max_img_per_gpu: 24  # Reduced for LoRA training
+
+limit_train_batches: 500
+limit_val_batches: 200
+
+
+# LoRA Configuration
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32.0
+  dropout: 0.05
+  target_modules:
+    - qkv
+  target_block_type: global  # Only apply LoRA to global attention blocks
+  block_indices: null  # null = all blocks, or specify list like [20, 21, 22, 23]
+  freeze_base: true
+
+
+# Visual Hull Mask Configuration
+visual_hull:
+  enabled: true
+  # During training, masks are loaded from data
+  # This config is for inference mask generation
+  sam2_model: sam2-hiera-large
+
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      training: True
+      load_mask: True
+      # Required by BaseDataset
+      get_nearby: False
+      load_depth: False
+      inside_random: True
+      allow_duplicate_img: False
+      augs:
+        scales: [0.9, 1.1]
+      rescale: True
+      rescale_aug: True
+      landscape_check: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        # OpenMaterial synthetic dataset with masks
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: train
+          data_dir: /YOUR/PATH/TO/OpenMaterial
+          min_num_images: 8
+          len_train: 100000
+          load_mask: True
+
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      training: False
+      load_mask: True
+      get_nearby: False
+      load_depth: False
+      inside_random: False
+      allow_duplicate_img: False
+      augs:
+        scales: null
+      rescale: True
+      rescale_aug: False
+      landscape_check: True
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: test
+          data_dir: /YOUR/PATH/TO/OpenMaterial
+          min_num_images: 8
+          len_test: 10000
+          load_mask: True
+
+
+logging:
+  log_dir: logs/${exp_name}
+  log_visuals: False
+  log_freq: 10
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_depth
+        - loss_mask_penalty
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_depth
+
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 2
+  resume_checkpoint_path: /YOUR/PATH/TO/PRETRAINED/VGGT/model.pt
+  strict: False
+
+
+loss:
+  _target_: loss.MultitaskLoss
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
+  point: null
+  track: null
+  # Mask-aware loss: penalize predictions in background regions
+  mask_penalty:
+    weight: 0.5
+    enabled: ${visual_hull.enabled}
+
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4  # Higher LR for LoRA fine-tuning
+    weight_decay: 0.01
+
+  # No frozen modules when using LoRA (LoRA handles freezing internally)
+  frozen_module_names: []
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      # Only clip LoRA parameters
+      - module_name: ["lora"]
+        max_norm: 1.0
+        norm_type: 2
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-6
+              end_value: 1e-4
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-4
+              end_value: 1e-6
+          lengths: [0.1, 0.9]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.01
+
+
+max_epochs: 10
+
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: False
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: True  # Required for LoRA
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True

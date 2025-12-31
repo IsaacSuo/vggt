@@ -181,11 +181,19 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        visual_hull_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            visual_hull_mask (torch.Tensor, optional): Binary mask with shape [B, S, H, W].
+                1 = foreground (object), 0 = background.
+                When provided, attention from/to background patches will be suppressed
+                in global attention blocks.
 
         Returns:
             (list[torch.Tensor], int):
@@ -230,6 +238,13 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # Convert visual hull mask to global attention mask if provided
+        global_attn_mask = None
+        if visual_hull_mask is not None:
+            global_attn_mask = self._create_global_attention_mask(
+                visual_hull_mask, B, S, P, H, W, images.device, images.dtype
+            )
+
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -242,7 +257,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=global_attn_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -281,9 +296,17 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, attn_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
+
+        Args:
+            tokens: Input tokens
+            B, S, P, C: Batch size, Sequence length, Patches, Channels
+            global_idx: Current global block index
+            pos: Optional positional encoding
+            attn_mask: Optional attention mask of shape (B, 1, S*P, S*P).
+                       Values should be 0 for positions to attend to and -inf for masked positions.
         """
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
@@ -296,13 +319,89 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                # Note: checkpoint doesn't support kwargs well, so we pass attn_mask positionally
+                tokens = checkpoint(
+                    self.global_blocks[global_idx], tokens, pos, attn_mask,
+                    use_reentrant=self.use_reentrant
+                )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    def _create_global_attention_mask(
+        self,
+        visual_hull_mask: torch.Tensor,
+        B: int, S: int, P: int, H: int, W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Convert spatial visual hull mask to global attention mask.
+
+        The visual hull mask indicates which pixels belong to the foreground object.
+        This function converts it to an attention mask that suppresses attention
+        from/to background patches.
+
+        Args:
+            visual_hull_mask: Binary mask with shape [B, S, H, W].
+                              1 = foreground, 0 = background.
+            B, S, P, H, W: Batch size, Sequence length, Patches (with special tokens), Height, Width
+            device: Target device
+            dtype: Target dtype
+
+        Returns:
+            Attention mask of shape (B, 1, S*P, S*P).
+            Values are 0 for valid attention and -inf for masked positions.
+        """
+        patch_h = H // self.patch_size
+        patch_w = W // self.patch_size
+        num_patches = patch_h * patch_w  # patches without special tokens
+
+        # Downsample mask to patch resolution using average pooling
+        # Shape: [B, S, H, W] -> [B*S, 1, H, W] -> [B*S, 1, patch_h, patch_w]
+        mask_flat = visual_hull_mask.view(B * S, 1, H, W).float()
+        mask_patches = F.avg_pool2d(mask_flat, kernel_size=self.patch_size, stride=self.patch_size)
+
+        # Threshold: if more than 50% of pixels in a patch are foreground, consider it foreground
+        mask_patches = (mask_patches > 0.5).float()  # [B*S, 1, patch_h, patch_w]
+
+        # Flatten to [B*S, num_patches]
+        mask_patches = mask_patches.view(B * S, num_patches)
+
+        # Reshape to [B, S, num_patches]
+        mask_patches = mask_patches.view(B, S, num_patches)
+
+        # Add special tokens (camera + register tokens are always valid)
+        # Special tokens shape: [B, S, patch_start_idx]
+        special_tokens_mask = torch.ones(B, S, self.patch_start_idx, device=device, dtype=mask_patches.dtype)
+
+        # Combine: [B, S, P] where P = patch_start_idx + num_patches
+        full_mask = torch.cat([special_tokens_mask, mask_patches], dim=-1)  # [B, S, P]
+
+        # Flatten to global attention shape: [B, S*P]
+        full_mask = full_mask.view(B, S * P)
+
+        # Create attention mask: query can attend to key if both are foreground or special tokens
+        # For Visual Hull Aware attention, we suppress:
+        # - Queries from background patches attending to anything (optional, can be relaxed)
+        # - Keys from background patches being attended to
+        # Here we implement: background keys cannot be attended to by anyone
+        # attn_mask[i,j] = -inf if key j is background, else 0
+
+        # key_mask: [B, 1, 1, S*P] - broadcast over queries and heads
+        key_mask = full_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S*P]
+
+        # Convert to additive mask: 0 for valid, -inf for masked
+        attn_mask = torch.zeros(B, 1, 1, S * P, device=device, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(key_mask == 0, float('-inf'))
+
+        # Expand to [B, 1, S*P, S*P] by broadcasting
+        attn_mask = attn_mask.expand(B, 1, S * P, S * P)
+
+        return attn_mask
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

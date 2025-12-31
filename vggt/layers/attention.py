@@ -47,7 +47,17 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+        """
+        Forward pass with optional attention mask support.
+
+        Args:
+            x: Input tensor of shape (B, N, C)
+            pos: Optional positional encoding for RoPE
+            attn_mask: Optional attention mask of shape (B, num_heads, N, N) or (B, 1, N, N).
+                       Values should be 0 for positions to attend to and -inf for positions to mask.
+                       When provided, forces explicit attention computation (not fused).
+        """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -57,11 +67,19 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if self.fused_attn:
+        # When attn_mask is provided, use explicit attention computation
+        use_fused = self.fused_attn and attn_mask is None
+
+        if use_fused:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+
+            # Apply attention mask (additive mask: 0 for attend, -inf for mask)
+            if attn_mask is not None:
+                attn = attn + attn_mask
+
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
