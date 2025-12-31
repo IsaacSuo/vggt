@@ -77,6 +77,8 @@ class Trainer:
         loss: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
+        lora: Optional[Dict[str, Any]] = None,
+        visual_hull: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """
@@ -111,6 +113,8 @@ class Trainer:
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
+        self.lora_conf = lora
+        self.visual_hull_conf = visual_hull
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -248,6 +252,29 @@ class Trainer:
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
+
+        # Apply LoRA if configured
+        if self.lora_conf is not None and self.lora_conf.get('enabled', False):
+            logging.info(f"[Start] Enabling LoRA with config: rank={self.lora_conf.get('rank', 32)}, "
+                        f"alpha={self.lora_conf.get('alpha', 32.0)}, "
+                        f"target_modules={self.lora_conf.get('target_modules', ['qkv'])}")
+            from vggt.lora import LoRAConfig
+            lora_config = LoRAConfig(
+                rank=self.lora_conf.get('rank', 32),
+                alpha=self.lora_conf.get('alpha', 32.0),
+                dropout=self.lora_conf.get('dropout', 0.0),
+                target_modules=list(self.lora_conf.get('target_modules', ['qkv'])),
+            )
+            self.model.enable_lora(
+                lora_config,
+                target_block_type=self.lora_conf.get('target_block_type', 'global'),
+                block_indices=self.lora_conf.get('block_indices', None),
+                freeze_base=self.lora_conf.get('freeze_base', True),
+            )
+            # Count trainable parameters
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            logging.info(f"[Done] LoRA enabled. Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):

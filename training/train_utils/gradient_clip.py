@@ -69,9 +69,10 @@ class GradientClipper:
                 remaining_params.append(param)
 
         if len(remaining_params) > 0:
-            print(f"Found {len(remaining_params)} parameters that won't be clipped")
-            print(remaining_params)
-            raise ValueError("Some parameters are not configured for gradient clipping")
+            # Log warning but don't raise error - allows LoRA training where only LoRA params are clipped
+            import logging
+            logging.warning(f"Found {len(remaining_params)} trainable parameters not covered by gradient clipping config. "
+                          "This is expected for LoRA training where only LoRA params are clipped.")
         
         # Store the computed parameters
         self.params_to_clip_by_config = params_to_clip_by_config
