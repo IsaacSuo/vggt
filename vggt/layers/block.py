@@ -85,7 +85,13 @@ class Block(nn.Module):
                        Values should be 0 for positions to attend to and -inf for positions to mask.
         """
         def attn_residual_func(x: Tensor, pos=None, attn_mask=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
+            # Only pass attn_mask if provided (MemEffAttention doesn't support it)
+            if attn_mask is not None:
+                return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
+            elif pos is not None:
+                return self.ls1(self.attn(self.norm1(x), pos=pos))
+            else:
+                return self.ls1(self.attn(self.norm1(x)))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
