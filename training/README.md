@@ -11,7 +11,12 @@ Before you begin, ensure you have completed the following steps:
    pip install -e .
    ```
 
-2. **Prepare the dataset and annotations:**
+2. **Install training-only dependencies used by the current training stack:**
+   ```bash
+   pip install iopath fvcore tensorboard
+   ```
+
+3. **Prepare the dataset and annotations:**
    - Download the Co3D dataset from the [official repository](https://github.com/facebookresearch/co3d).
    - Download the required annotation files from [Hugging Face](https://huggingface.co/datasets/JianyuanWang/co3d_anno/tree/main).
 
@@ -54,7 +59,207 @@ torchrun --nproc_per_node=4 launch.py
 
 The default configuration in `training/config/default.yaml` is set up for fine-tuning. It automatically resumes from a checkpoint and freezes the model's `aggregator` module during training.
 
-## 4. Training on Multiple Datasets
+## 4. OpenMaterial Fine-tuning
+
+This fork also contains a dedicated config for reflective / transparent material adaptation:
+
+- config: `training/config/lora_finetune.yaml`
+- dataset class: `training/data/datasets/openmaterial.py`
+
+### Expected OpenMaterial layout
+
+The loader expects scene folders under:
+
+```text
+OpenMaterial/datasets/
+  <hash>/
+    <scene_name>/
+      transforms_train.json
+      transforms_test.json
+      train/
+        images/
+        mask/      # or masks/
+      test/
+        images/
+        mask/      # or masks/
+  groundtruth_ablation/
+    <hash>/
+      clean_<hash>.ply
+```
+
+Important notes:
+
+- `train/images` and `test/images` are read from `transforms_*.json`
+- the loader supports both `mask/` and `masks/`
+- depth supervision is generated from the GT mesh `clean_<hash>.ply`
+- there is no point-cloud fallback anymore; if the GT mesh is missing, dataset loading raises an error
+
+### What the OpenMaterial loader does
+
+For each frame:
+
+- read RGB image
+- read foreground mask if available
+- resolve camera intrinsics and extrinsics from `transforms_*.json`
+- rasterize the GT mesh into a per-view depth map
+- apply the same crop / resize / augmentation path to image, depth, and mask
+
+The current rasterizer is CPU-side and includes:
+
+- near-plane clipping for triangles crossing the camera near plane
+- byte-budgeted LRU caching of rendered depth maps
+- optional reuse of offline precomputed mesh-depth `.npy` files
+
+The two most relevant knobs in `lora_finetune.yaml` are:
+
+- `mesh_near_plane`
+- `depth_cache_max_mb`
+- `depth_precompute_dir`
+- `depth_precompute_subdir`
+
+### Required path configuration
+
+Update the following fields in `training/config/lora_finetune.yaml`:
+
+- `data.train.dataset.dataset_configs[0].data_dir`
+- `data.val.dataset.dataset_configs[0].data_dir`
+- `checkpoint.resume_checkpoint_path`
+
+### Launch command
+
+Run from the `training/` directory:
+
+```bash
+torchrun --nproc_per_node=4 launch.py --config lora_finetune
+```
+
+Single-GPU variant:
+
+```bash
+PYTHONPATH=/YOUR/PATH/TO/vggt \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune
+```
+
+If you want to override paths from the command line:
+
+```bash
+torchrun --nproc_per_node=4 launch.py --config lora_finetune \
+  data.train.dataset.dataset_configs.0.data_dir=/YOUR/PATH/TO/OpenMaterial/datasets \
+  data.val.dataset.dataset_configs.0.data_dir=/YOUR/PATH/TO/OpenMaterial/datasets \
+  checkpoint.resume_checkpoint_path=/YOUR/PATH/TO/VGGT/model.pt
+```
+
+If you already downloaded the checkpoint into this fork, a concrete 1-GPU command looks like:
+
+```bash
+cd training
+PYTHONPATH=/home/fangsuo/py/vggt \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
+  data.train.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  data.val.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt
+```
+
+### Offline mesh-depth precompute
+
+The slow part of the first OpenMaterial batch is usually the CPU mesh rasterizer.
+If you want training startup to be much faster, precompute the raw mesh depth once and
+let the dataset load `.npy` files from disk.
+
+Default behavior after this change:
+
+- the dataset first looks for precomputed depth files
+- if found, it loads them directly
+- if missing, it falls back to the old online CPU rasterizer unless `require_precomputed_depth=True`
+
+By default the expected per-frame cache path is:
+
+```text
+<scene_dir>/
+  train/
+    images/000.png
+    depth_mesh/000.npy
+  test/
+    images/000.png
+    depth_mesh/000.npy
+```
+
+If you do not want to write into the dataset tree, you can place the cache under a separate root
+with the same `<hash>/<scene_name>/train|test/depth_mesh/*.npy` structure and point
+`depth_precompute_dir` at it.
+
+Example precompute command:
+
+```bash
+python training/data/preprocess/openmaterial_depth_cache.py \
+  --data_dir /home/fangsuo/py/OpenMaterial/datasets \
+  --split both \
+  --output_root /home/fangsuo/py/OpenMaterial/depth_cache
+```
+
+Then launch training with:
+
+```bash
+cd training
+PYTHONPATH=/home/fangsuo/py/vggt \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
+  data.train.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  data.val.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt \
+  data.train.common_config.depth_precompute_dir=/home/fangsuo/py/OpenMaterial/depth_cache \
+  data.val.common_config.depth_precompute_dir=/home/fangsuo/py/OpenMaterial/depth_cache
+```
+
+### Minimal cache-path verification
+
+If you want to verify that training really reads the offline depth cache instead of silently
+falling back to CPU rasterization, run a tiny smoke job with `require_precomputed_depth=True`.
+
+Concrete example used locally:
+
+```bash
+cd training
+PYTHONPATH=/home/fangsuo/py/vggt \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
+  logging.log_dir=/tmp/vggt_lora_verify_precomputed_small \
+  num_workers=0 \
+  max_img_per_gpu=2 \
+  data.train.max_img_per_gpu=2 \
+  data.val.max_img_per_gpu=2 \
+  data.train.common_config.img_nums=[2,2] \
+  data.val.common_config.img_nums=[2,2] \
+  limit_train_batches=1 \
+  limit_val_batches=0 \
+  max_epochs=1 \
+  val_epoch_freq=1000 \
+  data.train.dataset.dataset_configs.0.data_dir=/tmp/vggt_lora_smoke_subset \
+  data.val.dataset.dataset_configs.0.data_dir=/tmp/vggt_lora_smoke_subset \
+  checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt \
+  data.train.common_config.depth_precompute_dir=/tmp/vggt_lora_smoke_depth_cache \
+  data.val.common_config.depth_precompute_dir=/tmp/vggt_lora_smoke_depth_cache \
+  data.train.common_config.require_precomputed_depth=True \
+  data.val.common_config.require_precomputed_depth=True
+```
+
+What this proves:
+
+- if any requested cache file is missing, dataset loading fails immediately
+- if the run reaches `Train Epoch`, the training input path has already consumed valid cached depths
+- on this machine, a small dynamic batch such as `img_nums=[2,2]` and `max_img_per_gpu=2` is a safer probe than the default larger batch
+
+Note:
+
+- keep `img_size=518` when using the released `model.pt`
+- do not use this tiny verification batch as the final training configuration
+
+### Current caveats
+
+- Some OpenMaterial scenes may not have masks in the exact location expected by the loader. The loader handles `mask/` and `masks/`, but it still assumes one mask file per frame.
+- Mesh rasterization currently runs on CPU. This is fine for correctness and moderate-scale experiments, but it is not a production renderer.
+- The first full OpenMaterial batch can still be slow without offline depth precompute, because mesh depth generation happens inside dataloader workers.
+- The depth supervision is only as good as the GT mesh and camera alignment.
+
+## 5. Training on Multiple Datasets
 
 The dataloader supports multiple datasets naturally. For example, if you have downloaded VKitti using `preprocess/vkitti.sh`, you can train on Co3D+VKitti by configuring:
 
@@ -78,7 +283,7 @@ data:
 
 The ratio of different datasets can be controlled by setting `len_train`. For example, Co3D with `len_train: 10000` and VKitti with `len_train: 2000` will result in Co3D being sampled five times more frequently than VKitti.
 
-## 5. Common Questions
+## 6. Common Questions
 
 ### Memory Management
 
@@ -90,6 +295,14 @@ If you encounter out-of-memory (OOM) errors on your GPU, consider adjusting the 
 ### Learning Rate Tuning
 
 The main hyperparameter to be careful about is learning rate. Note that learning rate depends on the effective batch size, which is `batch_size_per_gpu × num_gpus`. Therefore, I highly recommend trying several learning rates based on your training setup. Generally, trying values like `5e-6`, `1e-5`, `5e-5`, `1e-4`, `5e-4` should be sufficient.
+
+For the current OpenMaterial LoRA config, the most sensitive knobs are usually:
+
+- learning rate
+- `block_indices`
+- `max_img_per_gpu`
+- `mesh_near_plane`
+- `depth_cache_max_mb`
 
 ### Tracking Head
 

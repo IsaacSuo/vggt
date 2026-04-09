@@ -153,16 +153,29 @@ class Trainer:
         self.model.to(self.device)
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
 
-        # Construct optimizers (after moving model to device)
+        ckpt_path = self._resolve_resume_checkpoint()
+        lora_checkpoint = ckpt_path is not None and self._checkpoint_contains_lora(ckpt_path)
+
+        # For LoRA fine-tuning from a base checkpoint, load the base weights before
+        # injecting LoRA modules so the original qkv/proj weights can be restored.
+        if ckpt_path is not None and self._lora_requested() and not lora_checkpoint:
+            self._load_resuming_checkpoint(
+                ckpt_path,
+                load_optimizer_state=False,
+                load_training_state=False,
+            )
+
+        self._enable_lora_if_configured()
+
+        # Construct optimizers (after moving model to device and after LoRA injection)
         if self.mode != "val":
             self.optims = construct_optimizers(self.model, self.optim_conf)
 
-        # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
-            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
+        # Load checkpoint if available or specified.
+        # LoRA training checkpoints must be loaded after LoRA injection so the wrapped
+        # parameter names match; plain pretrained checkpoints were already loaded above.
+        if ckpt_path is not None:
+            if not self._lora_requested() or lora_checkpoint:
                 self._load_resuming_checkpoint(ckpt_path)
 
         # Wrap the model with DDP
@@ -199,7 +212,63 @@ class Trainer:
         )
         self.rank = dist.get_rank()
 
-    def _load_resuming_checkpoint(self, ckpt_path: str):
+    def _resolve_resume_checkpoint(self) -> Optional[str]:
+        """Resolve the configured or auto-discovered checkpoint path."""
+        if self.checkpoint_conf.resume_checkpoint_path is not None:
+            return self.checkpoint_conf.resume_checkpoint_path
+        return get_resume_checkpoint(self.checkpoint_conf.save_dir)
+
+    def _lora_requested(self) -> bool:
+        return self.lora_conf is not None and self.lora_conf.get("enabled", False)
+
+    def _enable_lora_if_configured(self) -> None:
+        """Inject LoRA adapters only once, after the base weights are available."""
+        if not self._lora_requested():
+            return
+        if getattr(self.model, "_lora_enabled", False):
+            return
+
+        logging.info(
+            f"[Start] Enabling LoRA with config: rank={self.lora_conf.get('rank', 32)}, "
+            f"alpha={self.lora_conf.get('alpha', 32.0)}, "
+            f"target_modules={self.lora_conf.get('target_modules', ['qkv'])}"
+        )
+        from vggt.lora import LoRAConfig
+
+        lora_config = LoRAConfig(
+            rank=self.lora_conf.get("rank", 32),
+            alpha=self.lora_conf.get("alpha", 32.0),
+            dropout=self.lora_conf.get("dropout", 0.0),
+            target_modules=list(self.lora_conf.get("target_modules", ["qkv"])),
+        )
+        self.model.enable_lora(
+            lora_config,
+            target_block_type=self.lora_conf.get("target_block_type", "global"),
+            block_indices=self.lora_conf.get("block_indices", None),
+            freeze_base=self.lora_conf.get("freeze_base", True),
+        )
+
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        logging.info(
+            f"[Done] LoRA enabled. Trainable params: {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.2f}%)"
+        )
+
+    def _checkpoint_contains_lora(self, ckpt_path: str) -> bool:
+        """Check whether a checkpoint already contains LoRA-wrapped parameter names."""
+        with g_pathmgr.open(ckpt_path, "rb") as f:
+            checkpoint = torch.load(f, map_location="cpu")
+
+        model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        return any("lora_" in key or "original_layer." in key for key in model_state_dict.keys())
+
+    def _load_resuming_checkpoint(
+        self,
+        ckpt_path: str,
+        load_optimizer_state: bool = True,
+        load_training_state: bool = True,
+    ):
         """Loads a checkpoint from the given path to resume training."""
         logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
 
@@ -215,18 +284,19 @@ class Trainer:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if load_optimizer_state and hasattr(self, "optims") and "optimizer" in checkpoint:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
             self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
 
         # Load training progress
-        if "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
-        self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
-        self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+        if load_training_state:
+            if "epoch" in checkpoint:
+                self.epoch = checkpoint["epoch"]
+            self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
+            self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
         # Load AMP scaler state if available
-        if self.optim_conf.amp.enabled and "scaler" in checkpoint:
+        if load_optimizer_state and self.optim_conf.amp.enabled and "scaler" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler"])
 
     def _setup_device(self, device: str):
@@ -252,29 +322,6 @@ class Trainer:
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
-
-        # Apply LoRA if configured
-        if self.lora_conf is not None and self.lora_conf.get('enabled', False):
-            logging.info(f"[Start] Enabling LoRA with config: rank={self.lora_conf.get('rank', 32)}, "
-                        f"alpha={self.lora_conf.get('alpha', 32.0)}, "
-                        f"target_modules={self.lora_conf.get('target_modules', ['qkv'])}")
-            from vggt.lora import LoRAConfig
-            lora_config = LoRAConfig(
-                rank=self.lora_conf.get('rank', 32),
-                alpha=self.lora_conf.get('alpha', 32.0),
-                dropout=self.lora_conf.get('dropout', 0.0),
-                target_modules=list(self.lora_conf.get('target_modules', ['qkv'])),
-            )
-            self.model.enable_lora(
-                lora_config,
-                target_block_type=self.lora_conf.get('target_block_type', 'global'),
-                block_indices=self.lora_conf.get('block_indices', None),
-                freeze_base=self.lora_conf.get('freeze_base', True),
-            )
-            # Count trainable parameters
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in self.model.parameters())
-            logging.info(f"[Done] LoRA enabled. Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
@@ -723,7 +770,7 @@ class Trainer:
         """
         tensor_keys = [
             "images", "depths", "extrinsics", "intrinsics", 
-            "cam_points", "world_points", "point_masks", 
+            "cam_points", "world_points", "point_masks", "masks",
         ]        
         string_keys = ["seq_name"]
         
@@ -770,7 +817,15 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        visual_hull_mask = None
+        if (
+            self.visual_hull_conf is not None
+            and self.visual_hull_conf.get("enabled", False)
+            and "masks" in batch
+        ):
+            visual_hull_mask = batch["masks"]
+
+        y_hat = model(images=batch["images"], visual_hull_mask=visual_hull_mask)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
@@ -892,4 +947,3 @@ def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
         return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
     else:
         return data
-

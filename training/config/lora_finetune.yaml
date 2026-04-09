@@ -54,7 +54,13 @@ data:
       load_mask: True
       # Required by BaseDataset
       get_nearby: False
-      load_depth: False
+      load_depth: True
+      mesh_near_plane: 1.0e-3
+      depth_cache_max_mb: 512
+      depth_precompute_dir: null
+      depth_precompute_subdir: depth_mesh
+      prefer_precomputed_depth: True
+      require_precomputed_depth: False
       inside_random: True
       allow_duplicate_img: False
       augs:
@@ -72,6 +78,7 @@ data:
           min_num_images: 8
           len_train: 100000
           load_mask: True
+          load_mesh_depth: True
 
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
@@ -84,7 +91,13 @@ data:
       training: False
       load_mask: True
       get_nearby: False
-      load_depth: False
+      load_depth: True
+      mesh_near_plane: 1.0e-3
+      depth_cache_max_mb: 512
+      depth_precompute_dir: null
+      depth_precompute_subdir: depth_mesh
+      prefer_precomputed_depth: True
+      require_precomputed_depth: False
       inside_random: False
       allow_duplicate_img: False
       augs:
@@ -101,6 +114,7 @@ data:
           min_num_images: 8
           len_test: 10000
           load_mask: True
+          load_mesh_depth: True
 
 
 logging:
@@ -119,7 +133,6 @@ logging:
         - loss_objective
         - loss_camera
         - loss_depth
-        - loss_mask_penalty
     val:
       keys_to_log:
         - loss_objective
@@ -145,10 +158,6 @@ loss:
     valid_range: 0.98
   point: null
   track: null
-  # Mask-aware loss: penalize predictions in background regions
-  mask_penalty:
-    weight: 0.5
-    enabled: ${visual_hull.enabled}
 
 
 optim:

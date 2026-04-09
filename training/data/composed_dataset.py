@@ -144,6 +144,9 @@ class ComposedDataset(Dataset, ABC):
             "point_masks": point_masks,
         }
 
+        if "masks" in batch and all(mask is not None for mask in batch["masks"]):
+            sample["masks"] = torch.from_numpy(np.stack(batch["masks"]).astype(np.float32))
+
         # --- Track Processing (if enabled) ---
         if self.load_track:
             if batch["tracks"] is not None:

@@ -39,7 +39,7 @@ def normalize_camera_extrinsics_and_points_batch(
     and optionally scales the scene to have unit average distance.
     
     Args:
-        extrinsics: Camera extrinsic matrices of shape (B, S, 3, 4)
+        extrinsics: Camera extrinsic matrices of shape (B, S, 3, 4) or (B, S, 4, 4)
         cam_points: 3D points in camera coordinates of shape (B, S, H, W, 3) or (*,3)
         world_points: 3D points in world coordinates of shape (B, S, H, W, 3) or (*,3)
         depths: Depth maps of shape (B, S, H, W)
@@ -60,20 +60,29 @@ def normalize_camera_extrinsics_and_points_batch(
     check_valid_tensor(depths, "depths")
 
 
+    if extrinsics.ndim != 4 or extrinsics.shape[-2:] not in ((3, 4), (4, 4)):
+        raise ValueError(
+            "extrinsics must have shape (B, S, 3, 4) or (B, S, 4, 4), "
+            f"got {tuple(extrinsics.shape)}"
+        )
+
     B, S, _, _ = extrinsics.shape
     device = extrinsics.device
     assert device == torch.device("cpu")
 
 
-    # Convert extrinsics to homogeneous form: (B, N,4,4)
-    extrinsics_homog = torch.cat(
-        [
-            extrinsics,
-            torch.zeros((B, S, 1, 4), device=device),
-        ],
-        dim=-2,
-    )
-    extrinsics_homog[:, :, -1, -1] = 1.0
+    # Accept either 3x4 world-to-camera matrices or already-homogeneous 4x4 matrices.
+    if extrinsics.shape[-2] == 3:
+        extrinsics_homog = torch.cat(
+            [
+                extrinsics,
+                torch.zeros((B, S, 1, 4), device=device),
+            ],
+            dim=-2,
+        )
+        extrinsics_homog[:, :, -1, -1] = 1.0
+    else:
+        extrinsics_homog = extrinsics.clone()
 
     # first_cam_extrinsic_inv, the inverse of the first camera's extrinsic matrix
     # which can be also viewed as the cam_to_world extrinsic matrix
@@ -86,8 +95,8 @@ def normalize_camera_extrinsics_and_points_batch(
         # since we are transforming the world points to the first camera's coordinate system
         # we directly use the cam_from_world extrinsic matrix of the first camera
         # instead of using the inverse of the first camera's extrinsic matrix
-        R = extrinsics[:, 0, :3, :3]
-        t = extrinsics[:, 0, :3, 3]
+        R = extrinsics_homog[:, 0, :3, :3]
+        t = extrinsics_homog[:, 0, :3, 3]
         new_world_points = (world_points @ R.transpose(-1, -2).unsqueeze(1).unsqueeze(2)) + t.unsqueeze(1).unsqueeze(2).unsqueeze(3)
     else:
         new_world_points = None
@@ -120,7 +129,6 @@ def normalize_camera_extrinsics_and_points_batch(
 
 
     return new_extrinsics, new_cam_points, new_world_points, new_depths
-
 
 
 
