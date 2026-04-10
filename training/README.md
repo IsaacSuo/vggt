@@ -160,6 +160,10 @@ For the current OpenMaterial server runs, this repo now also includes:
 - entry script: `training/run_openmaterial_probe_server_disjoint.sh`
 - config: `training/config/openmaterial_train_server_disjoint.yaml`
 - entry script: `training/run_openmaterial_train_server_disjoint.sh`
+- config: `training/config/openmaterial_probe_server_disjoint_mem.yaml`
+- entry script: `training/run_openmaterial_probe_server_disjoint_mem.sh`
+- config: `training/config/openmaterial_train_server_disjoint_mem.yaml`
+- entry script: `training/run_openmaterial_train_server_disjoint_mem.sh`
 - split helper: `training/data/preprocess/openmaterial_scene_split.py`
 - split helper entry script: `training/run_openmaterial_scene_split_server.sh`
 
@@ -377,6 +381,21 @@ cd /opt/data/private/fyp/vggt
 training/run_openmaterial_probe_server_disjoint.sh
 training/run_openmaterial_train_server_disjoint.sh
 ```
+
+If you want to test the newer memory-efficient masked-attention patch without overwriting the previous disjoint run directories, use the separate `*_disjoint_mem` entrypoints instead:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_probe_server_disjoint_mem.sh
+training/run_openmaterial_train_server_disjoint_mem.sh
+```
+
+These write to separate output roots:
+
+- `/opt/data/private/fyp/vggt_runs/probe_disjoint_mem`
+- `/opt/data/private/fyp/vggt_runs/train_disjoint_mem`
+
+The first post-patch configs start with `max_img_per_gpu=6` and `img_nums=[4,6]` to exploit the reduced masked-attention memory path while keeping the original `*_disjoint` runs intact.
 
 What this proves:
 

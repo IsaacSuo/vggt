@@ -495,6 +495,10 @@ Operational note from server bring-up:
   - entry script `training/run_openmaterial_probe_server_disjoint.sh`
   - config `training/config/openmaterial_train_server_disjoint.yaml`
   - entry script `training/run_openmaterial_train_server_disjoint.sh`
+  - config `training/config/openmaterial_probe_server_disjoint_mem.yaml`
+  - entry script `training/run_openmaterial_probe_server_disjoint_mem.sh`
+  - config `training/config/openmaterial_train_server_disjoint_mem.yaml`
+  - entry script `training/run_openmaterial_train_server_disjoint_mem.sh`
   - split helper `training/data/preprocess/openmaterial_scene_split.py`
   - split helper entry script `training/run_openmaterial_scene_split_server.sh`
 - on that server, the `nvdiffrast` backend processed one 90-frame scene in under 10 seconds, which is dramatically faster than the old CPU rasterizer
@@ -549,8 +553,15 @@ Mechanism:
 1. user supplies `visual_hull_mask`
 2. mask is downsampled to patch resolution
 3. special tokens are kept always valid
-4. a global attention mask is built
+4. a global key mask is built
 5. background keys are suppressed in global attention
+
+Implementation note:
+
+- the visual-hull attention path now uses a broadcastable key mask of shape `(B, 1, 1, S*P)` instead of materializing a full `(B, 1, S*P, S*P)` mask
+- on current PyTorch this allows masked global attention to stay on the fused `scaled_dot_product_attention` path instead of falling back to explicit `qk^T -> softmax -> av`
+- this change is specifically aimed at reducing training memory pressure for OpenMaterial runs with `visual_hull_mask`
+- to avoid overwriting earlier disjoint training outputs, the post-patch server runs use separate `*_disjoint_mem` configs and output directories under `/opt/data/private/fyp/vggt_runs/*_disjoint_mem`
 
 Important nuance:
 

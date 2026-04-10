@@ -1,0 +1,23 @@
+defaults:
+  - openmaterial_probe_server_disjoint
+  - _self_
+
+exp_name: openmaterial_probe_server_disjoint_mem
+max_img_per_gpu: 6
+
+logging:
+  log_dir: /opt/data/private/fyp/vggt_runs/probe_disjoint_mem
+
+checkpoint:
+  save_dir: /opt/data/private/fyp/vggt_runs/probe_disjoint_mem/ckpts
+
+data:
+  train:
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_nums: [4, 6]
+
+  val:
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_nums: [4, 6]

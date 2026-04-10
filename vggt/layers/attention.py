@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -54,9 +55,10 @@ class Attention(nn.Module):
         Args:
             x: Input tensor of shape (B, N, C)
             pos: Optional positional encoding for RoPE
-            attn_mask: Optional attention mask of shape (B, num_heads, N, N) or (B, 1, N, N).
-                       Values should be 0 for positions to attend to and -inf for positions to mask.
-                       When provided, forces explicit attention computation (not fused).
+            attn_mask: Optional attention mask broadcastable to the attention score shape.
+                       Supports either:
+                       - boolean masks where True means "keep" and False means "mask"
+                       - additive masks with 0 for valid positions and -inf for masked positions
         """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -67,18 +69,25 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        # When attn_mask is provided, use explicit attention computation
-        use_fused = self.fused_attn and attn_mask is None
+        use_fused = self.fused_attn
 
         if use_fused:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
 
-            # Apply attention mask (additive mask: 0 for attend, -inf for mask)
             if attn_mask is not None:
-                attn = attn + attn_mask
+                if attn_mask.dtype == torch.bool:
+                    attn = attn.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    attn = attn + attn_mask
 
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)

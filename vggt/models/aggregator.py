@@ -305,8 +305,8 @@ class Aggregator(nn.Module):
             B, S, P, C: Batch size, Sequence length, Patches, Channels
             global_idx: Current global block index
             pos: Optional positional encoding
-            attn_mask: Optional attention mask of shape (B, 1, S*P, S*P).
-                       Values should be 0 for positions to attend to and -inf for masked positions.
+            attn_mask: Optional key mask broadcastable to attention scores.
+                       For visual-hull training this is a key-only mask of shape (B, 1, 1, S*P).
         """
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
@@ -353,8 +353,8 @@ class Aggregator(nn.Module):
             dtype: Target dtype
 
         Returns:
-            Attention mask of shape (B, 1, S*P, S*P).
-            Values are 0 for valid attention and -inf for masked positions.
+            Boolean key mask of shape (B, 1, 1, S*P).
+            True = valid key, False = masked key.
         """
         patch_h = H // self.patch_size
         patch_w = W // self.patch_size
@@ -391,17 +391,8 @@ class Aggregator(nn.Module):
         # Here we implement: background keys cannot be attended to by anyone
         # attn_mask[i,j] = -inf if key j is background, else 0
 
-        # key_mask: [B, 1, 1, S*P] - broadcast over queries and heads
-        key_mask = full_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S*P]
-
-        # Convert to additive mask: 0 for valid, -inf for masked
-        attn_mask = torch.zeros(B, 1, 1, S * P, device=device, dtype=dtype)
-        attn_mask = attn_mask.masked_fill(key_mask == 0, float('-inf'))
-
-        # Expand to [B, 1, S*P, S*P] by broadcasting
-        attn_mask = attn_mask.expand(B, 1, S * P, S * P)
-
-        return attn_mask
+        # Key-only mask: [B, 1, 1, S*P], broadcast over queries and heads.
+        return full_mask.unsqueeze(1).unsqueeze(2).to(device=device, dtype=torch.bool)
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
