@@ -1,0 +1,43 @@
+defaults:
+  - lora_finetune
+  - _self_
+
+exp_name: openmaterial_train_server
+
+logging:
+  log_dir: /opt/data/private/fyp/vggt_runs/train
+
+checkpoint:
+  save_dir: /opt/data/private/fyp/vggt_runs/train/ckpts
+  resume_checkpoint_path: /opt/data/private/fyp/vggt/checkpoints/model.pt
+
+data:
+  train:
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: train
+          data_dir: /opt/data/private/dataset/OpenMaterial_ablation
+          min_num_images: 8
+          len_train: 100000
+          load_mask: True
+          load_mesh_depth: True
+    common_config:
+      depth_precompute_dir: /opt/data/private/dataset/OpenMaterial_ablation_depth_cache
+      require_precomputed_depth: True
+
+  val:
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: test
+          data_dir: /opt/data/private/dataset/OpenMaterial_ablation
+          min_num_images: 8
+          len_test: 10000
+          load_mask: True
+          load_mesh_depth: True
+    common_config:
+      depth_precompute_dir: /opt/data/private/dataset/OpenMaterial_ablation_depth_cache
+      require_precomputed_depth: True

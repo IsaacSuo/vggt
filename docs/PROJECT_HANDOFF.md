@@ -486,9 +486,11 @@ Operational note from server bring-up:
   - but `torchrun` resolved to `/usr/local/bin/torchrun`
   - that `torchrun` spawned `/usr/bin/python`, which caused `ModuleNotFoundError: No module named 'hydra'` even though `hydra` was installed in the active env
   - on that server, the reliable launch path was `python -m torch.distributed.run ...` from the active environment instead of the bare `torchrun` on `PATH`
-- to avoid repeating the long probe CLI on that server, this repo now includes:
+- to avoid repeating long server CLI overrides, this repo now includes:
   - config `training/config/openmaterial_probe_server.yaml`
   - entry script `training/run_openmaterial_probe_server.sh`
+  - config `training/config/openmaterial_train_server.yaml`
+  - entry script `training/run_openmaterial_train_server.sh`
 - on that server, the `nvdiffrast` backend processed one 90-frame scene in under 10 seconds, which is dramatically faster than the old CPU rasterizer
 
 ## 11. Fork-Specific Mechanisms

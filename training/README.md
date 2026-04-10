@@ -150,12 +150,14 @@ PYTHONPATH=/YOUR/PATH/TO/vggt \
 python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune
 ```
 
-For the current OpenMaterial server probe, this repo now also includes:
+For the current OpenMaterial server runs, this repo now also includes:
 
 - config: `training/config/openmaterial_probe_server.yaml`
 - entry script: `training/run_openmaterial_probe_server.sh`
+- config: `training/config/openmaterial_train_server.yaml`
+- entry script: `training/run_openmaterial_train_server.sh`
 
-That pair bakes in the validated server paths, `img_size=518`, cached-depth settings, and the conservative 1-GPU probe batch shape, so the probe no longer needs a long CLI override list.
+These entries bake in the validated server paths, `img_size=518`, cached-depth settings, and the validated launch method. The probe config also keeps the conservative 1-GPU probe batch shape, while the train config inherits the normal `lora_finetune.yaml` training hyperparameters.
 
 If you want to override paths from the command line:
 
@@ -332,6 +334,13 @@ If you still need a one-off override, append it to the script call, for example:
 ```bash
 cd /opt/data/private/fyp/vggt
 training/run_openmaterial_probe_server.sh logging.log_dir=/opt/data/private/fyp/vggt_runs/probe_alt
+```
+
+For full training on that server, use:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_train_server.sh
 ```
 
 What this proves:
