@@ -165,6 +165,8 @@ For the current OpenMaterial server runs, this repo now also includes:
 
 These entries bake in the validated server paths, `img_size=518`, cached-depth settings, and the validated launch method. The probe config also keeps the conservative 1-GPU probe batch shape, while the train config inherits the normal `lora_finetune.yaml` training hyperparameters.
 
+After the first 1-GPU disjoint training attempt on the RTX 5090, the inherited larger dynamic image count was still too aggressive and produced a CUDA OOM inside global attention. The fixed server train configs now default to a conservative `max_img_per_gpu=3` and `img_nums=[2,3]`, which is a safer starting point for real training bring-up.
+
 If you want to override paths from the command line:
 
 ```bash

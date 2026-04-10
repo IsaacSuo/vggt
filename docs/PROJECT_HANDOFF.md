@@ -730,6 +730,7 @@ For the current OpenMaterial training route:
 5. On this machine, start smoke or probe runs with conservative image count / batch settings before scaling up.
 6. On this server, prefer `python -m torch.distributed.run ...` over the bare `torchrun` on `PATH` for OpenMaterial probe and training runs.
 7. For any benchmark claim, do not train on all 105 scenes; generate a scene-disjoint manifest split first and use the `*_disjoint` server configs.
+8. On the RTX 5090 server, the inherited larger `lora_finetune.yaml` dynamic image count still OOMed in global attention during 1-GPU training; the fixed server train configs therefore start with `max_img_per_gpu=3` and `img_nums=[2,3]`.
 
 ## 17. What To Update In This Handoff When The Project Changes
 
