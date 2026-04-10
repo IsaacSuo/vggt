@@ -78,6 +78,29 @@ def _resolve_mask_path(image_path: str) -> Optional[str]:
     return None
 
 
+def _load_scene_name_filter(path: str) -> set[str]:
+    """Load scene identifiers from a newline-delimited manifest file."""
+    scene_names = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            scene_names.add(line)
+    return scene_names
+
+
+def _scene_matches_filter(
+    scene_name: str,
+    hash_id: str,
+    allowed_scene_names: Optional[set[str]],
+) -> bool:
+    """Match either `scene_name` or `hash_id/scene_name` against a manifest set."""
+    if allowed_scene_names is None:
+        return True
+    return scene_name in allowed_scene_names or f"{hash_id}/{scene_name}" in allowed_scene_names
+
+
 def _replace_image_dir_and_extension(path: str, replacement_dir: str, extension: str) -> str:
     root, _ = osp.splitext(path)
     replaced = root.replace("/images/", f"/{replacement_dir}/")
@@ -316,6 +339,7 @@ class OpenMaterialDataset(BaseDataset):
         len_test: int = 10000,
         load_mask: bool = True,
         load_mesh_depth: bool = True,
+        scene_list_path: Optional[str] = None,
     ):
         """
         Initialize the OpenMaterial dataset.
@@ -356,6 +380,21 @@ class OpenMaterialDataset(BaseDataset):
         self.split = split
         self.min_num_images = min_num_images
         self.len_train = len_train if split == "train" else len_test
+        self.scene_list_path = scene_list_path
+        self.allowed_scene_names = None
+
+        if self.scene_list_path is not None:
+            if not osp.exists(self.scene_list_path):
+                raise FileNotFoundError(
+                    f"OpenMaterial scene list not found: {self.scene_list_path}"
+                )
+            self.allowed_scene_names = _load_scene_name_filter(self.scene_list_path)
+            logger.info(
+                "OpenMaterial [%s]: restricting scenes using `%s` (%d entries)",
+                split,
+                self.scene_list_path,
+                len(self.allowed_scene_names),
+            )
 
         # Find all scenes
         self.scenes = self._find_scenes()
@@ -386,6 +425,14 @@ class OpenMaterialDataset(BaseDataset):
 
                 scene_dir = osp.dirname(tf_path)
                 scene_name = osp.basename(scene_dir)
+                hash_id = osp.basename(osp.dirname(scene_dir))
+
+                if not _scene_matches_filter(
+                    scene_name=scene_name,
+                    hash_id=hash_id,
+                    allowed_scene_names=self.allowed_scene_names,
+                ):
+                    continue
 
                 # Extract camera intrinsics
                 intrinsics = {
@@ -399,7 +446,7 @@ class OpenMaterialDataset(BaseDataset):
 
                 scenes.append({
                     'name': scene_name,
-                    'hash_id': osp.basename(osp.dirname(scene_dir)),
+                    'hash_id': hash_id,
                     'dir': scene_dir,
                     'transform_path': tf_path,
                     'frames': frames,

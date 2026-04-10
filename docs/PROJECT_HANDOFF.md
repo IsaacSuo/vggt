@@ -491,6 +491,12 @@ Operational note from server bring-up:
   - entry script `training/run_openmaterial_probe_server.sh`
   - config `training/config/openmaterial_train_server.yaml`
   - entry script `training/run_openmaterial_train_server.sh`
+  - config `training/config/openmaterial_probe_server_disjoint.yaml`
+  - entry script `training/run_openmaterial_probe_server_disjoint.sh`
+  - config `training/config/openmaterial_train_server_disjoint.yaml`
+  - entry script `training/run_openmaterial_train_server_disjoint.sh`
+  - split helper `training/data/preprocess/openmaterial_scene_split.py`
+  - split helper entry script `training/run_openmaterial_scene_split_server.sh`
 - on that server, the `nvdiffrast` backend processed one 90-frame scene in under 10 seconds, which is dramatically faster than the old CPU rasterizer
 
 ## 11. Fork-Specific Mechanisms
@@ -723,6 +729,7 @@ For the current OpenMaterial training route:
 4. Prefer GPU depth precompute with `nvdiffrast` when a suitable CUDA environment is available.
 5. On this machine, start smoke or probe runs with conservative image count / batch settings before scaling up.
 6. On this server, prefer `python -m torch.distributed.run ...` over the bare `torchrun` on `PATH` for OpenMaterial probe and training runs.
+7. For any benchmark claim, do not train on all 105 scenes; generate a scene-disjoint manifest split first and use the `*_disjoint` server configs.
 
 ## 17. What To Update In This Handoff When The Project Changes
 

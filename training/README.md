@@ -156,6 +156,12 @@ For the current OpenMaterial server runs, this repo now also includes:
 - entry script: `training/run_openmaterial_probe_server.sh`
 - config: `training/config/openmaterial_train_server.yaml`
 - entry script: `training/run_openmaterial_train_server.sh`
+- config: `training/config/openmaterial_probe_server_disjoint.yaml`
+- entry script: `training/run_openmaterial_probe_server_disjoint.sh`
+- config: `training/config/openmaterial_train_server_disjoint.yaml`
+- entry script: `training/run_openmaterial_train_server_disjoint.sh`
+- split helper: `training/data/preprocess/openmaterial_scene_split.py`
+- split helper entry script: `training/run_openmaterial_scene_split_server.sh`
 
 These entries bake in the validated server paths, `img_size=518`, cached-depth settings, and the validated launch method. The probe config also keeps the conservative 1-GPU probe batch shape, while the train config inherits the normal `lora_finetune.yaml` training hyperparameters.
 
@@ -341,6 +347,33 @@ For full training on that server, use:
 ```bash
 cd /opt/data/private/fyp/vggt
 training/run_openmaterial_train_server.sh
+```
+
+### Scene-disjoint split for benchmark
+
+Using all 105 scenes for training and validation is acceptable for bring-up and ablations, but it is not a clean benchmark because validation still comes from scenes seen during training.
+
+To create a held-out scene split on the server:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_scene_split_server.sh
+```
+
+This writes:
+
+- `/opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/train.txt`
+- `/opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/test.txt`
+- `/opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/summary.json`
+
+The manifest format is one scene identifier per line. Each entry can be either `scene_name` or `hash_id/scene_name`; the split script writes the safer `hash_id/scene_name` form.
+
+After generating the manifests, use the disjoint probe/train entrypoints:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_probe_server_disjoint.sh
+training/run_openmaterial_train_server_disjoint.sh
 ```
 
 What this proves:

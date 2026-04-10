@@ -1,0 +1,38 @@
+defaults:
+  - openmaterial_probe_server
+  - _self_
+
+exp_name: openmaterial_probe_server_disjoint
+
+logging:
+  log_dir: /opt/data/private/fyp/vggt_runs/probe_disjoint
+
+checkpoint:
+  save_dir: /opt/data/private/fyp/vggt_runs/probe_disjoint/ckpts
+
+data:
+  train:
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: train
+          data_dir: /opt/data/private/dataset/OpenMaterial_ablation
+          scene_list_path: /opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/train.txt
+          min_num_images: 8
+          len_train: 100000
+          load_mask: True
+          load_mesh_depth: True
+
+  val:
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.openmaterial.OpenMaterialDataset
+          split: test
+          data_dir: /opt/data/private/dataset/OpenMaterial_ablation
+          scene_list_path: /opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/test.txt
+          min_num_images: 8
+          len_test: 10000
+          load_mask: True
+          load_mesh_depth: True
