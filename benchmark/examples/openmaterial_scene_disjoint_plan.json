@@ -1,0 +1,69 @@
+{
+  "seed": 42,
+  "models": [
+    {
+      "name": "baseline_vggt",
+      "checkpoint_path": "/opt/data/private/fyp/vggt/checkpoints/model.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true
+    },
+    {
+      "name": "lora_openmaterial",
+      "checkpoint_path": "/opt/data/private/fyp/vggt_runs/train_disjoint_mem/ckpts/checkpoint.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true,
+      "lora": {
+        "rank": 32,
+        "alpha": 32.0,
+        "dropout": 0.05,
+        "target_modules": [
+          "qkv"
+        ],
+        "target_block_type": "global",
+        "block_indices": null,
+        "freeze_base": false,
+        "merge_after_load": false
+      }
+    }
+  ],
+  "datasets": [
+    {
+      "name": "openmaterial_scene_disjoint_test",
+      "type": "openmaterial",
+      "config": {
+        "data_dir": "/opt/data/private/dataset/OpenMaterial_ablation",
+        "scene_list_path": "/opt/data/private/fyp/vggt_runs/splits/openmaterial_scene_split_seed42/test.txt",
+        "split": "test",
+        "num_frames": 16,
+        "frame_selection": "evenly_spaced",
+        "img_size": 518,
+        "patch_size": 14,
+        "load_mask": true,
+        "load_depth": true,
+        "load_mesh_depth": true,
+        "depth_precompute_dir": "/opt/data/private/dataset/OpenMaterial_ablation_depth_cache",
+        "require_precomputed_depth": true,
+        "min_num_images": 8,
+        "gt_mesh_sample_points": 20000,
+        "pred_point_sample_points": 20000,
+        "covisibility_min_overlap_ratio": 0.05,
+        "covisibility_min_visible_points": 256,
+        "small_translation_epsilon": 0.0001,
+        "tsdf_resolution": 256,
+        "tsdf_sdf_trunc_factor": 4.0
+      }
+    }
+  ]
+}

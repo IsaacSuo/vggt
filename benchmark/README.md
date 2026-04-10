@@ -1,0 +1,88 @@
+# Standalone Benchmark
+
+This benchmark path is intentionally separate from `training/Trainer`.
+
+Use it when you want to compare:
+
+- multiple checkpoints
+- across one or more benchmark datasets
+- with a stable inference-first evaluation loop
+
+instead of reusing `mode=val` from the training stack.
+
+## How it works
+
+1. Write a benchmark plan JSON.
+2. Register each model explicitly, including LoRA settings if needed.
+3. Register each dataset through a dataset adapter.
+4. Run the benchmark once and collect:
+   - `per_sample.json`
+   - `per_sample.csv`
+   - `summary.json`
+   - `summary.csv`
+   - `summary.md`
+
+## Current adapter support
+
+- `openmaterial`
+
+The OpenMaterial adapter reuses the existing dataset preprocessing path so images,
+masks, depths, and camera targets stay aligned with the current training semantics.
+
+## OpenMaterial protocol
+
+Camera:
+
+- `auc3`
+- `auc30`
+- evaluate only covisible frame pairs
+- relative rotation error in degrees
+- relative translation direction error in degrees
+- joint pair error = `max(rot_err, trans_dir_err)`
+- if `|t_gt| < epsilon`, drop translation direction error and keep the rotation error for that pair
+
+Reconstruction:
+
+- use `depth + camera -> TSDF -> fused point cloud`
+- apply the benchmark valid mask before fusion
+- normalize prediction density through TSDF extraction plus fixed-count surface sampling
+- `cd_l1` normalized by GT mesh bbox diagonal
+- `f1@1%`
+- `f1@5%`
+
+Depth:
+
+- `delta1`
+- `absrel`
+
+Aggregation and sampling:
+
+- one OpenMaterial scene = one benchmark sample
+- aggregate scene-level rows with macro-average
+- frame sampling is fixed-count `evenly_spaced` unless the plan overrides it
+
+Operational note:
+
+- if the dataset tree does not already contain `depth_mesh/*.npy`, benchmark runs can fall back to online CPU mesh rasterization
+- for real runs, precompute mesh-depth caches first with `training/data/preprocess/openmaterial_depth_cache.py`
+
+## Example
+
+Start from:
+
+- [openmaterial_scene_disjoint_plan.json](/home/fangsuo/py/vggt/benchmark/examples/openmaterial_scene_disjoint_plan.json)
+
+Run:
+
+```bash
+cd /opt/data/private/fyp/vggt
+PYTHONPATH=/opt/data/private/fyp/vggt:/opt/data/private/fyp/vggt/training \
+python benchmark/run.py \
+  --plan benchmark/examples/openmaterial_scene_disjoint_plan.json \
+  --output-dir /opt/data/private/fyp/vggt_runs/benchmark_eval
+```
+
+## Extending to another dataset
+
+Add a new adapter under `benchmark/adapters/` and register it in
+`benchmark/registry.py`.

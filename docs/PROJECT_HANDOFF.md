@@ -502,6 +502,22 @@ Operational note from server bring-up:
   - split helper `training/data/preprocess/openmaterial_scene_split.py`
   - split helper entry script `training/run_openmaterial_scene_split_server.sh`
 - on that server, the `nvdiffrast` backend processed one 90-frame scene in under 10 seconds, which is dramatically faster than the old CPU rasterizer
+- benchmark evaluation should not be built on top of `Trainer.mode=val`
+- the repo now has a standalone benchmark path under `benchmark/`
+  - `benchmark/run.py`: plan-driven evaluator for multiple models and datasets
+  - `benchmark/model_loader.py`: explicit checkpoint + LoRA loading
+  - `benchmark/adapters/`: dataset adapters
+  - `benchmark/examples/openmaterial_scene_disjoint_plan.json`: reference plan format
+- the benchmark design assumes explicit model specs and dataset adapters instead of reusing Hydra train configs as the primary evaluation interface
+- the OpenMaterial standalone benchmark protocol is now:
+  - scene-level evaluation with macro-average aggregation
+  - fixed-count `evenly_spaced` frame sampling unless the plan overrides it
+  - camera metrics: covisible pairs only, report `AUC3` and `AUC30`, and for pairs with near-zero GT translation keep only the rotation error
+  - depth metrics: `delta1` and `AbsRel`
+  - reconstruction metrics: use predicted depth plus predicted cameras, fuse with TSDF, then compare a fixed-density fused point cloud against the GT mesh
+  - report `CD-L1` normalized by the GT mesh bbox diagonal plus `F1@1%` and `F1@5%` using bbox-diagonal thresholds
+  - do not treat predicted `world_points` as the final reconstruction protocol
+- if the OpenMaterial dataset tree does not already contain `depth_mesh/*.npy`, standalone benchmark runs may hit online CPU mesh rasterization through the dataset adapter; for real runs, precompute caches first with `training/data/preprocess/openmaterial_depth_cache.py`
 
 ## 11. Fork-Specific Mechanisms
 
