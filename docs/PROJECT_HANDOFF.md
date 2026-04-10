@@ -562,6 +562,7 @@ Implementation note:
 - on current PyTorch this allows masked global attention to stay on the fused `scaled_dot_product_attention` path instead of falling back to explicit `qk^T -> softmax -> av`
 - this change is specifically aimed at reducing training memory pressure for OpenMaterial runs with `visual_hull_mask`
 - to avoid overwriting earlier disjoint training outputs, the post-patch server runs use separate `*_disjoint_mem` configs and output directories under `/opt/data/private/fyp/vggt_runs/*_disjoint_mem`
+- on the RTX 5090 server, probe runs reached `img_nums=[18,20]` with about 25 GB peak memory on the first step, so the current recommended single-GPU training config for the post-patch path is `max_img_per_gpu=20` and `img_nums=[18,20]`
 
 Important nuance:
 

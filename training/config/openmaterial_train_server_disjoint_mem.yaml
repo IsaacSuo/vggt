@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 exp_name: openmaterial_train_server_disjoint_mem
-max_img_per_gpu: 6
+max_img_per_gpu: 20
 
 logging:
   log_dir: /opt/data/private/fyp/vggt_runs/train_disjoint_mem
@@ -15,9 +15,9 @@ data:
   train:
     max_img_per_gpu: ${max_img_per_gpu}
     common_config:
-      img_nums: [4, 6]
+      img_nums: [18, 20]
 
   val:
     max_img_per_gpu: ${max_img_per_gpu}
     common_config:
-      img_nums: [4, 6]
+      img_nums: [18, 20]

@@ -395,7 +395,7 @@ These write to separate output roots:
 - `/opt/data/private/fyp/vggt_runs/probe_disjoint_mem`
 - `/opt/data/private/fyp/vggt_runs/train_disjoint_mem`
 
-The first post-patch configs start with `max_img_per_gpu=6` and `img_nums=[4,6]` to exploit the reduced masked-attention memory path while keeping the original `*_disjoint` runs intact.
+After server probing on the RTX 5090, the post-patch `*_disjoint_mem` configs were promoted to `max_img_per_gpu=20` and `img_nums=[18,20]`. That range was able to pass the 1-step probe while staying below the 32 GB card limit, and is the current recommended single-GPU training regime for the memory-efficient masked-attention path.
 
 What this proves:
 
