@@ -449,6 +449,7 @@ Important constraints:
 - mask paths are mildly inconsistent in the wild, so the loader supports both `mask/` and `masks/`
 - the preferred fast path is offline mesh-depth precompute via `training/data/preprocess/openmaterial_depth_cache.py`
 - training can read those caches either from sidecar `depth_mesh/` folders under each scene or from a separate cache root via `depth_precompute_dir`
+- the precompute script now supports GPU rasterization backends, including `nvdiffrast`
 
 What was verified on this fork:
 
@@ -456,6 +457,7 @@ What was verified on this fork:
 - LoRA GPU smoke training works at `img_size=518`
 - offline OpenMaterial depth caches were generated successfully for the smoke subset
 - training was verified to consume those offline depth caches instead of falling back to online CPU mesh rasterization
+- the `nvdiffrast` GPU backend successfully generated one full OpenMaterial scene cache on a server with CUDA 13.0 and RTX 5090
 
 How the cache-path verification was done:
 
@@ -469,7 +471,25 @@ How the cache-path verification was done:
 Practical implication:
 
 - the main remaining blocker for full OpenMaterial training startup is no longer "does the dataset read cache files"
-- it is now "precompute the full dataset cache and choose a GPU-safe training batch shape"
+- it is now "finish full-dataset GPU precompute and choose a GPU-safe training batch shape"
+
+Operational note from server bring-up:
+
+- `nvdiffrast` is not available on PyPI; install it from GitHub
+- if `nvcc` exists but install fails with `cicc: not found`, check whether `CUDA_HOME` points at the full toolkit root such as `/usr/local/cuda-13.0`
+- one real server had:
+  - project at `/opt/data/private/fyp/vggt`
+  - dataset at `/opt/data/private/dataset/OpenMaterial_ablation`
+  - cache output at `/opt/data/private/dataset/OpenMaterial_ablation_depth_cache`
+- on that server, a Python environment mismatch also occurred during probe launch:
+  - `python` in the active env was `/root/om/bin/python`
+  - but `torchrun` resolved to `/usr/local/bin/torchrun`
+  - that `torchrun` spawned `/usr/bin/python`, which caused `ModuleNotFoundError: No module named 'hydra'` even though `hydra` was installed in the active env
+  - on that server, the reliable launch path was `python -m torch.distributed.run ...` from the active environment instead of the bare `torchrun` on `PATH`
+- to avoid repeating the long probe CLI on that server, this repo now includes:
+  - config `training/config/openmaterial_probe_server.yaml`
+  - entry script `training/run_openmaterial_probe_server.sh`
+- on that server, the `nvdiffrast` backend processed one 90-frame scene in under 10 seconds, which is dramatically faster than the old CPU rasterizer
 
 ## 11. Fork-Specific Mechanisms
 
@@ -698,7 +718,9 @@ For the current OpenMaterial training route:
 1. Verify whether the task is about dataset/cache throughput or model behavior.
 2. If it is about startup slowness, check `depth_precompute_dir` and `require_precomputed_depth` first.
 3. Keep `img_size=518` when loading the released pre-trained checkpoint.
-4. On this machine, start smoke or probe runs with conservative image count / batch settings before scaling up.
+4. Prefer GPU depth precompute with `nvdiffrast` when a suitable CUDA environment is available.
+5. On this machine, start smoke or probe runs with conservative image count / batch settings before scaling up.
+6. On this server, prefer `python -m torch.distributed.run ...` over the bare `torchrun` on `PATH` for OpenMaterial probe and training runs.
 
 ## 17. What To Update In This Handoff When The Project Changes
 

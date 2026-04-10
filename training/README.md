@@ -140,6 +140,23 @@ PYTHONPATH=/YOUR/PATH/TO/vggt \
 torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune
 ```
 
+Important launcher note:
+
+- one real server had `python=/root/om/bin/python` but `torchrun=/usr/local/bin/torchrun`, and training failed with `ModuleNotFoundError: No module named 'hydra'`
+- on that server, prefer launching with the active environment explicitly:
+
+```bash
+PYTHONPATH=/YOUR/PATH/TO/vggt \
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune
+```
+
+For the current OpenMaterial server probe, this repo now also includes:
+
+- config: `training/config/openmaterial_probe_server.yaml`
+- entry script: `training/run_openmaterial_probe_server.sh`
+
+That pair bakes in the validated server paths, `img_size=518`, cached-depth settings, and the conservative 1-GPU probe batch shape, so the probe no longer needs a long CLI override list.
+
 If you want to override paths from the command line:
 
 ```bash
@@ -197,12 +214,48 @@ python training/data/preprocess/openmaterial_depth_cache.py \
   --output_root /home/fangsuo/py/OpenMaterial/depth_cache
 ```
 
+GPU variant with `nvdiffrast`:
+
+```bash
+pip install setuptools wheel ninja
+pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
+
+CUDA_HOME=/usr/local/cuda-13.0 \
+TORCH_CUDA_ARCH_LIST=12.0 \
+PYTHONPATH=/home/fangsuo/py/vggt:/home/fangsuo/py/vggt/training \
+python training/data/preprocess/openmaterial_depth_cache.py \
+  --data_dir /home/fangsuo/py/OpenMaterial/datasets \
+  --split both \
+  --output_root /home/fangsuo/py/OpenMaterial/depth_cache \
+  --backend nvdiffrast \
+  --frame_batch_size 8
+```
+
+Important installation note for `nvdiffrast`:
+
+- it is installed from GitHub, not from PyPI
+- if the build fails with `.../nvvm/bin/cicc: not found`, your `CUDA_HOME` or `/usr/local/cuda` path likely points at an incomplete toolkit path instead of the real CUDA root
+- on Ada/Blackwell-class GPUs, explicitly setting `TORCH_CUDA_ARCH_LIST` can avoid unnecessary arch compilation
+
 Then launch training with:
 
 ```bash
 cd training
 PYTHONPATH=/home/fangsuo/py/vggt \
 torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
+  data.train.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  data.val.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
+  checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt \
+  data.train.common_config.depth_precompute_dir=/home/fangsuo/py/OpenMaterial/depth_cache \
+  data.val.common_config.depth_precompute_dir=/home/fangsuo/py/OpenMaterial/depth_cache
+```
+
+On that server, use:
+
+```bash
+cd training
+PYTHONPATH=/home/fangsuo/py/vggt \
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
   data.train.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
   data.val.dataset.dataset_configs.0.data_dir=/home/fangsuo/py/OpenMaterial/datasets \
   checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt \
@@ -241,6 +294,46 @@ torchrun --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_fine
   data.val.common_config.require_precomputed_depth=True
 ```
 
+On that server, the same probe should be launched with:
+
+```bash
+cd training
+PYTHONPATH=/home/fangsuo/py/vggt \
+python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=1 launch.py --config lora_finetune \
+  logging.log_dir=/tmp/vggt_lora_verify_precomputed_small \
+  num_workers=0 \
+  max_img_per_gpu=2 \
+  data.train.max_img_per_gpu=2 \
+  data.val.max_img_per_gpu=2 \
+  data.train.common_config.img_nums=[2,2] \
+  data.val.common_config.img_nums=[2,2] \
+  limit_train_batches=1 \
+  limit_val_batches=0 \
+  max_epochs=1 \
+  val_epoch_freq=1000 \
+  data.train.dataset.dataset_configs.0.data_dir=/tmp/vggt_lora_smoke_subset \
+  data.val.dataset.dataset_configs.0.data_dir=/tmp/vggt_lora_smoke_subset \
+  checkpoint.resume_checkpoint_path=/home/fangsuo/py/vggt/checkpoints/model.pt \
+  data.train.common_config.depth_precompute_dir=/tmp/vggt_lora_smoke_depth_cache \
+  data.val.common_config.depth_precompute_dir=/tmp/vggt_lora_smoke_depth_cache \
+  data.train.common_config.require_precomputed_depth=True \
+  data.val.common_config.require_precomputed_depth=True
+```
+
+The equivalent fixed entrypoint is:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_probe_server.sh
+```
+
+If you still need a one-off override, append it to the script call, for example:
+
+```bash
+cd /opt/data/private/fyp/vggt
+training/run_openmaterial_probe_server.sh logging.log_dir=/opt/data/private/fyp/vggt_runs/probe_alt
+```
+
 What this proves:
 
 - if any requested cache file is missing, dataset loading fails immediately
@@ -255,7 +348,7 @@ Note:
 ### Current caveats
 
 - Some OpenMaterial scenes may not have masks in the exact location expected by the loader. The loader handles `mask/` and `masks/`, but it still assumes one mask file per frame.
-- Mesh rasterization currently runs on CPU. This is fine for correctness and moderate-scale experiments, but it is not a production renderer.
+- Mesh rasterization still has a CPU fallback, but the preferred precompute route is now the GPU `nvdiffrast` backend when available.
 - The first full OpenMaterial batch can still be slow without offline depth precompute, because mesh depth generation happens inside dataloader workers.
 - The depth supervision is only as good as the GT mesh and camera alignment.
 

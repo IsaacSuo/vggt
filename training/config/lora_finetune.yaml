@@ -5,6 +5,7 @@
 
 defaults:
   - default_dataset.yaml
+  - _self_
 
 exp_name: lora_visual_hull
 img_size: 518
