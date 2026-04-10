@@ -59,6 +59,7 @@ class MultitaskLoss(torch.nn.Module):
             depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
             depth_loss = depth_loss * self.depth["weight"]
             total_loss = total_loss + depth_loss
+            depth_loss_dict["loss_depth"] = depth_loss
             loss_dict.update(depth_loss_dict)
 
         # 3D point reconstruction loss - if world points are predicted
@@ -67,6 +68,7 @@ class MultitaskLoss(torch.nn.Module):
             point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
             point_loss = point_loss * self.point["weight"]
             total_loss = total_loss + point_loss
+            point_loss_dict["loss_point"] = point_loss
             loss_dict.update(point_loss_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
@@ -805,5 +807,4 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
 
