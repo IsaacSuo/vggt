@@ -374,6 +374,73 @@ def _shared_sparse_point_pairs(
     return pair_indices
 
 
+def _project_object_points_to_mask(
+    points_world: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    image_hw: Tuple[int, int],
+    point_radius: int,
+    dilation_kernel_size: int,
+    projection_trim_quantile: float,
+) -> np.ndarray:
+    height, width = image_hw
+    if points_world.size == 0:
+        return np.zeros((height, width), dtype=bool)
+
+    cam_points = points_world @ extrinsic[:, :3].transpose() + extrinsic[:, 3]
+    depth = cam_points[:, 2]
+    valid = np.isfinite(depth) & (depth > 1e-8)
+    if not np.any(valid):
+        return np.zeros((height, width), dtype=bool)
+
+    cam_points = cam_points[valid]
+    depth = depth[valid]
+    u = intrinsic[0, 0] * (cam_points[:, 0] / depth) + intrinsic[0, 2]
+    v = intrinsic[1, 1] * (cam_points[:, 1] / depth) + intrinsic[1, 2]
+    x = np.rint(u).astype(np.int32)
+    y = np.rint(v).astype(np.int32)
+    in_bounds = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    if not np.any(in_bounds):
+        return np.zeros((height, width), dtype=bool)
+
+    x = x[in_bounds]
+    y = y[in_bounds]
+    trim_q = float(projection_trim_quantile)
+    if 0.0 < trim_q < 0.5 and x.size >= 16:
+        x_min = int(np.floor(np.quantile(x, trim_q)))
+        x_max = int(np.ceil(np.quantile(x, 1.0 - trim_q)))
+        y_min = int(np.floor(np.quantile(y, trim_q)))
+        y_max = int(np.ceil(np.quantile(y, 1.0 - trim_q)))
+        trimmed = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+        if np.any(trimmed):
+            x = x[trimmed]
+            y = y[trimmed]
+    mask = np.zeros((height, width), dtype=np.float32)
+    for dx in range(-point_radius, point_radius + 1):
+        xx = x + dx
+        valid_x = (xx >= 0) & (xx < width)
+        if not np.any(valid_x):
+            continue
+        for dy in range(-point_radius, point_radius + 1):
+            yy = y + dy
+            valid_xy = valid_x & (yy >= 0) & (yy < height)
+            if not np.any(valid_xy):
+                continue
+            mask[yy[valid_xy], xx[valid_xy]] = 1.0
+
+    if dilation_kernel_size > 1:
+        kernel_size = int(dilation_kernel_size)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        mask_tensor = torch.from_numpy(mask)[None, None]
+        mask = (
+            F.max_pool2d(mask_tensor, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)[0, 0]
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+    return mask > 0.5
+
+
 class NeROGlossySyntheticAdapter(BenchmarkDatasetAdapter):
     def __init__(self, spec: DatasetSpec):
         super().__init__(spec)
@@ -636,6 +703,9 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         self.max_scenes = config.get("max_scenes")
         self.gt_point_sample_points = int(config.get("gt_point_sample_points", 20000))
         self.pred_point_sample_points = int(config.get("pred_point_sample_points", 20000))
+        self.object_mask_point_radius = int(config.get("object_mask_point_radius", 2))
+        self.object_mask_dilation_kernel_size = int(config.get("object_mask_dilation_kernel_size", 7))
+        self.object_mask_projection_trim_quantile = float(config.get("object_mask_projection_trim_quantile", 0.05))
         self.camera_min_shared_sparse_points = int(config.get("camera_min_shared_sparse_points", 16))
         self.small_translation_epsilon = float(config.get("small_translation_epsilon", 1e-4))
         self.tsdf_resolution = int(config.get("tsdf_resolution", 256))
@@ -737,6 +807,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                         "name": scene_name,
                         "frames": indexed_frames,
                         "gt_points_member": gt_points_member,
+                        "object_points_member": assets["object_points_member"],
                     }
                 )
 
@@ -800,6 +871,12 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 intrinsic_tensor = torch.from_numpy(np.stack(intrinsics).astype(np.float32))
 
                 gt_points = self._load_scene_gt_points(tf, str(scene["gt_points_member"]))
+                object_points_member = scene.get("object_points_member")
+                object_points = (
+                    self._load_scene_gt_points(tf, str(object_points_member))
+                    if object_points_member is not None
+                    else gt_points
+                )
                 normalized_extrinsics, avg_scale = _normalize_camera_extrinsics_from_reference_points(
                     extrinsics=extrinsic_tensor,
                     reference_world_points=gt_points.to(torch.float32),
@@ -808,6 +885,24 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     frame_records=selected_frames,
                     min_shared_points=self.camera_min_shared_sparse_points,
                 )
+                object_masks = []
+                object_points_np = object_points.cpu().numpy().astype(np.float32, copy=False)
+                for extrinsic, intrinsic in zip(extrinsics, intrinsics):
+                    object_mask = _project_object_points_to_mask(
+                        points_world=object_points_np,
+                        extrinsic=np.asarray(extrinsic, dtype=np.float32),
+                        intrinsic=np.asarray(intrinsic, dtype=np.float32),
+                        image_hw=(self.image_size, self.image_size),
+                        point_radius=self.object_mask_point_radius,
+                        dilation_kernel_size=self.object_mask_dilation_kernel_size,
+                        projection_trim_quantile=self.object_mask_projection_trim_quantile,
+                    )
+                    object_masks.append(object_mask)
+                object_mask_tensor = torch.from_numpy(np.stack(object_masks))
+                object_mask_coverage = [
+                    float(mask.astype(np.float32, copy=False).mean())
+                    for mask in object_masks
+                ]
 
                 sample_id = f"{self.subset}/{scene['name']}"
                 yield BenchmarkSample(
@@ -817,7 +912,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     depths=None,
                     cam_points=None,
                     world_points=None,
-                    point_masks=None,
+                    point_masks=object_mask_tensor,
                     extrinsics=normalized_extrinsics,
                     intrinsics=intrinsic_tensor,
                     raw_depths=None,
@@ -830,6 +925,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                         "seq_name": str(scene["name"]),
                         "frame_ids": frame_ids,
                         "frame_names": frame_names,
+                        "object_mask_coverage": object_mask_coverage,
                     },
                     protocol={
                         "camera_pair_indices": camera_pair_indices,
