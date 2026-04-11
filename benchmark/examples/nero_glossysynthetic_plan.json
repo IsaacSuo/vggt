@@ -3,7 +3,7 @@
   "models": [
     {
       "name": "baseline_vggt",
-      "checkpoint_path": "/home/fangsuo/py/vggt/checkpoints/model.pt",
+      "checkpoint_path": "/opt/data/private/fyp/vggt/checkpoints/model.pt",
       "model_kwargs": {
         "enable_camera": true,
         "enable_depth": true,
@@ -16,10 +16,10 @@
   ],
   "datasets": [
     {
-      "name": "nero_glossysynthetic_local",
+      "name": "nero_glossysynthetic_server",
       "type": "nero_glossy_synthetic",
       "config": {
-        "data_path": "/home/fangsuo/py/vggt/.local_benchmarks/nero/GlossySynthetic.tar.gz",
+        "data_path": "/opt/data/private/dataset/benchmark/nero/GlossySynthetic.tar.gz",
         "subset": "GlossySynthetic",
         "num_frames": 16,
         "frame_selection": "evenly_spaced",

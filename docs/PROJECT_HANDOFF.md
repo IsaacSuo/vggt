@@ -508,7 +508,7 @@ Operational note from server bring-up:
   - `benchmark/model_loader.py`: explicit checkpoint + LoRA loading
   - `benchmark/adapters/`: dataset adapters
   - `benchmark/examples/openmaterial_scene_disjoint_plan.json`: reference plan format
-  - `benchmark/examples/nero_glossysynthetic_plan.json`: local reference plan for NeRO GlossySynthetic
+  - `benchmark/examples/nero_glossysynthetic_plan.json`: server-style reference plan for NeRO GlossySynthetic
 - the benchmark design assumes explicit model specs and dataset adapters instead of reusing Hydra train configs as the primary evaluation interface
 - the OpenMaterial standalone benchmark protocol is now:
   - scene-level evaluation with macro-average aggregation
