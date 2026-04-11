@@ -94,6 +94,18 @@ python benchmark/run.py \
   --output-dir /opt/data/private/fyp/vggt_runs/benchmark_eval
 ```
 
+For NeRO GlossyReal qualitative figures from dataset viewpoints:
+
+```bash
+cd /opt/data/private/fyp/vggt
+PYTHONPATH=/opt/data/private/fyp/vggt:/opt/data/private/fyp/vggt/training \
+python benchmark/visualize_nero_glossyreal.py \
+  --plan benchmark/examples/nero_glossyreal_plan.json \
+  --scene bear \
+  --models baseline_vggt lora_openmaterial \
+  --output-dir /opt/data/private/fyp/vggt_runs/benchmark_viz/nero_glossyreal_bear
+```
+
 ## Download helpers
 
 This repo also includes benchmark dataset download helpers under `scripts/`:
