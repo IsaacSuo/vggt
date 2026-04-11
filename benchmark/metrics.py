@@ -8,8 +8,88 @@ import numpy as np
 import torch
 
 from benchmark.adapters.base import BenchmarkSample
-from data.datasets.openmaterial import _load_ply_mesh
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+
+_PLY_DTYPE_MAP = {
+    "char": "i1",
+    "uchar": "u1",
+    "short": "i2",
+    "ushort": "u2",
+    "int": "i4",
+    "uint": "u4",
+    "float": "f4",
+    "float32": "f4",
+    "double": "f8",
+    "float64": "f8",
+}
+
+
+def _load_ply_mesh(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    vertex_count = None
+    face_count = None
+    vertex_properties = []
+    current_element = None
+
+    with open(path, "rb") as f:
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"Unexpected EOF while reading PLY header: {path}")
+
+            decoded = line.decode("ascii", errors="strict").strip()
+            if decoded == "ply" or decoded == "format binary_little_endian 1.0" or decoded.startswith("comment "):
+                continue
+            if decoded.startswith("element "):
+                parts = decoded.split()
+                current_element = parts[1]
+                if current_element == "vertex":
+                    vertex_count = int(parts[2])
+                    vertex_properties = []
+                elif current_element == "face":
+                    face_count = int(parts[2])
+                continue
+            if decoded.startswith("property "):
+                parts = decoded.split()
+                if current_element == "vertex":
+                    _, prop_type, prop_name = parts
+                    if prop_type not in _PLY_DTYPE_MAP:
+                        raise ValueError(f"Unsupported PLY property type `{prop_type}` in {path}")
+                    vertex_properties.append((prop_name, "<" + _PLY_DTYPE_MAP[prop_type]))
+                continue
+            if decoded == "end_header":
+                break
+
+        if vertex_count is None or face_count is None or not vertex_properties:
+            raise ValueError(f"PLY mesh metadata missing in {path}")
+
+        vertex_dtype = np.dtype(vertex_properties)
+        vertices = np.fromfile(f, dtype=vertex_dtype, count=vertex_count)
+
+        triangles = []
+        for _ in range(face_count):
+            degree = np.fromfile(f, dtype=np.uint8, count=1)
+            if degree.size == 0:
+                raise ValueError(f"Unexpected EOF while reading PLY faces: {path}")
+            degree_int = int(degree[0])
+            face = np.fromfile(f, dtype=np.int32, count=degree_int)
+            if face.size != degree_int:
+                raise ValueError(f"Unexpected EOF while reading PLY face indices: {path}")
+            if degree_int < 3:
+                continue
+            if degree_int == 3:
+                triangles.append(face.tolist())
+            else:
+                for i in range(1, degree_int - 1):
+                    triangles.append([int(face[0]), int(face[i]), int(face[i + 1])])
+
+    required = ("x", "y", "z")
+    if any(name not in vertices.dtype.names for name in required):
+        raise ValueError(f"PLY file {path} does not contain XYZ coordinates")
+
+    vertices_xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=-1).astype(np.float32)
+    faces = np.asarray(triangles, dtype=np.int32)
+    return vertices_xyz, faces
 
 
 def _pairwise_indices(num_frames: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -294,6 +374,14 @@ def _chunked_nearest_distances(src: torch.Tensor, dst: torch.Tensor, chunk_size:
     return torch.cat(distances, dim=0)
 
 
+def _points_bbox_diagonal(points: torch.Tensor) -> float:
+    if points.numel() == 0:
+        return 0.0
+    bbox_min = points.min(dim=0).values
+    bbox_max = points.max(dim=0).values
+    return float(torch.linalg.norm(bbox_max - bbox_min).item())
+
+
 @lru_cache(maxsize=64)
 def _load_mesh_vertices_faces(mesh_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return _load_ply_mesh(mesh_path)
@@ -334,6 +422,30 @@ def _sample_gt_mesh_points(mesh_path: str, num_points: int, seed: int) -> np.nda
     bary_c = sqrt_u * v
     sampled = bary_a * chosen[:, 0] + bary_b * chosen[:, 1] + bary_c * chosen[:, 2]
     return sampled.astype(np.float32, copy=False)
+
+
+def _prepare_gt_reference_points(
+    sample: BenchmarkSample,
+    device: torch.device,
+    dtype: torch.dtype,
+    point_budget: int,
+    sample_seed: int,
+) -> Tuple[torch.Tensor, float]:
+    if sample.gt_point_cloud is not None:
+        gt_points = sample.gt_point_cloud.to(device=device, dtype=dtype)
+        if gt_points.ndim != 2 or gt_points.shape[-1] != 3:
+            raise ValueError("gt_point_cloud must have shape [N, 3].")
+        bbox_diagonal = _points_bbox_diagonal(gt_points)
+        gt_points = _downsample_points(gt_points, point_budget, sample_seed)
+        return gt_points, bbox_diagonal
+
+    if sample.gt_mesh_path is not None:
+        gt_points_np = _sample_gt_mesh_points(sample.gt_mesh_path, point_budget, sample_seed)
+        gt_points = torch.from_numpy(gt_points_np).to(device=device, dtype=dtype)
+        bbox_diagonal = _mesh_bbox_diagonal(sample.gt_mesh_path)
+        return gt_points, bbox_diagonal
+
+    raise ValueError("Sample is missing both gt_mesh_path and gt_point_cloud.")
 
 
 def _tsdf_fused_points(
@@ -408,7 +520,7 @@ def _tsdf_fused_points(
 
 
 def compute_reconstruction_metrics(predictions: Dict[str, torch.Tensor], sample: BenchmarkSample) -> Dict[str, float]:
-    if sample.gt_mesh_path is None or sample.point_masks is None or "depth" not in predictions or "pose_enc" not in predictions:
+    if sample.point_masks is None or "depth" not in predictions or "pose_enc" not in predictions:
         return {}
 
     pred_depth = predictions["depth"].detach().squeeze(0).squeeze(-1)
@@ -420,13 +532,23 @@ def compute_reconstruction_metrics(predictions: Dict[str, torch.Tensor], sample:
     pred_depth = pred_depth.to(torch.float32) * float(sample.normalization_scale or 1.0)
     valid_mask = sample.point_masks.to(device=pred_depth.device).bool()
 
-    bbox_diagonal = _mesh_bbox_diagonal(sample.gt_mesh_path)
-    if bbox_diagonal <= 0:
-        return {}
-
     sample_seed = _sample_seed(sample.sample_id)
     pred_point_budget = int(sample.protocol.get("pred_point_sample_points", 20000))
-    gt_point_budget = int(sample.protocol.get("gt_mesh_sample_points", 20000))
+    gt_point_budget = int(
+        sample.protocol.get(
+            "gt_point_sample_points",
+            sample.protocol.get("gt_mesh_sample_points", 20000),
+        )
+    )
+    gt_points, bbox_diagonal = _prepare_gt_reference_points(
+        sample=sample,
+        device=pred_depth.device,
+        dtype=pred_depth.dtype,
+        point_budget=gt_point_budget,
+        sample_seed=sample_seed,
+    )
+    if bbox_diagonal <= 0:
+        return {}
     tsdf_resolution = int(sample.protocol.get("tsdf_resolution", 256))
     tsdf_sdf_trunc_factor = float(sample.protocol.get("tsdf_sdf_trunc_factor", 4.0))
     voxel_length = bbox_diagonal / max(tsdf_resolution, 1)
@@ -445,8 +567,7 @@ def compute_reconstruction_metrics(predictions: Dict[str, torch.Tensor], sample:
         return {}
 
     pred_points = _downsample_points(pred_points, pred_point_budget, sample_seed)
-    gt_points_np = _sample_gt_mesh_points(sample.gt_mesh_path, gt_point_budget, sample_seed)
-    gt_points = torch.from_numpy(gt_points_np).to(device=pred_points.device, dtype=pred_points.dtype)
+    gt_points = gt_points.to(device=pred_points.device, dtype=pred_points.dtype)
 
     pred_to_gt = _chunked_nearest_distances(pred_points, gt_points)
     gt_to_pred = _chunked_nearest_distances(gt_points, pred_points)

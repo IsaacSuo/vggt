@@ -1,0 +1,39 @@
+{
+  "seed": 42,
+  "models": [
+    {
+      "name": "baseline_vggt",
+      "checkpoint_path": "/home/fangsuo/py/vggt/checkpoints/model.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true
+    }
+  ],
+  "datasets": [
+    {
+      "name": "nero_glossysynthetic_local",
+      "type": "nero_glossy_synthetic",
+      "config": {
+        "data_path": "/home/fangsuo/py/vggt/.local_benchmarks/nero/GlossySynthetic.tar.gz",
+        "subset": "GlossySynthetic",
+        "num_frames": 16,
+        "frame_selection": "evenly_spaced",
+        "img_size": 518,
+        "depth_scale": 5000.0,
+        "depth_invalid_value": 65535,
+        "pred_point_sample_points": 20000,
+        "gt_point_sample_points": 20000,
+        "covisibility_min_overlap_ratio": 0.05,
+        "covisibility_min_visible_points": 256,
+        "small_translation_epsilon": 0.0001,
+        "tsdf_resolution": 256,
+        "tsdf_sdf_trunc_factor": 4.0
+      }
+    }
+  ]
+}

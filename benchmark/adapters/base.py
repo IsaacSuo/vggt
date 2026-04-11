@@ -24,6 +24,7 @@ class BenchmarkSample:
     normalization_scale: Optional[float] = None
     normalization_reference_extrinsic: Optional[torch.Tensor] = None
     gt_mesh_path: Optional[str] = None
+    gt_point_cloud: Optional[torch.Tensor] = None
     metadata: Dict[str, object] = field(default_factory=dict)
     protocol: Dict[str, object] = field(default_factory=dict)
 

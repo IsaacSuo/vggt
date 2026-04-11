@@ -25,9 +25,14 @@ instead of reusing `mode=val` from the training stack.
 ## Current adapter support
 
 - `openmaterial`
+- `nero_glossy_synthetic`
 
 The OpenMaterial adapter reuses the existing dataset preprocessing path so images,
 masks, depths, and camera targets stay aligned with the current training semantics.
+
+The NeRO GlossySynthetic adapter reads the official `GlossySynthetic.tar.gz`
+release directly, uses per-frame `camera.pkl` and `depth.png`, and evaluates
+reconstruction against each scene's `eval_pts.ply` point cloud.
 
 ## OpenMaterial protocol
 
