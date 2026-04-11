@@ -13,4 +13,8 @@ def create_dataset_adapter(spec: DatasetSpec) -> BenchmarkDatasetAdapter:
         from benchmark.adapters.nero import NeROGlossySyntheticAdapter
 
         return NeROGlossySyntheticAdapter(spec)
+    if spec.type == "nero_glossy_real":
+        from benchmark.adapters.nero import NeROGlossyRealAdapter
+
+        return NeROGlossyRealAdapter(spec)
     raise ValueError(f"Unsupported benchmark dataset type: {spec.type}")

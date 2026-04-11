@@ -197,6 +197,17 @@ def _visible_overlap_ratio(
 
 
 def _covisible_pair_indices(sample: BenchmarkSample) -> Tuple[torch.Tensor, torch.Tensor]:
+    explicit_pairs = sample.protocol.get("camera_pair_indices")
+    if explicit_pairs is not None:
+        device = sample.images.device
+        if len(explicit_pairs) == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty
+        pair_tensor = torch.as_tensor(explicit_pairs, dtype=torch.long, device=device)
+        if pair_tensor.ndim != 2 or pair_tensor.shape[1] != 2:
+            raise ValueError("camera_pair_indices must have shape [N, 2].")
+        return pair_tensor[:, 0], pair_tensor[:, 1]
+
     if (
         sample.world_points is None
         or sample.depths is None
@@ -432,12 +443,12 @@ def _prepare_gt_reference_points(
     sample_seed: int,
 ) -> Tuple[torch.Tensor, float]:
     if sample.gt_point_cloud is not None:
-        gt_points = sample.gt_point_cloud.to(device=device, dtype=dtype)
+        gt_points = sample.gt_point_cloud.to(dtype=torch.float32)
         if gt_points.ndim != 2 or gt_points.shape[-1] != 3:
             raise ValueError("gt_point_cloud must have shape [N, 3].")
         bbox_diagonal = _points_bbox_diagonal(gt_points)
         gt_points = _downsample_points(gt_points, point_budget, sample_seed)
-        return gt_points, bbox_diagonal
+        return gt_points.to(device=device, dtype=dtype), bbox_diagonal
 
     if sample.gt_mesh_path is not None:
         gt_points_np = _sample_gt_mesh_points(sample.gt_mesh_path, point_budget, sample_seed)
@@ -520,7 +531,11 @@ def _tsdf_fused_points(
 
 
 def compute_reconstruction_metrics(predictions: Dict[str, torch.Tensor], sample: BenchmarkSample) -> Dict[str, float]:
-    if sample.point_masks is None or "depth" not in predictions or "pose_enc" not in predictions:
+    if (
+        ("depth" not in predictions)
+        or ("pose_enc" not in predictions)
+        or (sample.gt_point_cloud is None and sample.gt_mesh_path is None)
+    ):
         return {}
 
     pred_depth = predictions["depth"].detach().squeeze(0).squeeze(-1)
@@ -530,7 +545,12 @@ def compute_reconstruction_metrics(predictions: Dict[str, torch.Tensor], sample:
     pred_extrinsics = _denormalize_extrinsics(pred_extrinsics_norm.squeeze(0), sample)
     pred_intrinsics = pred_intrinsics.squeeze(0).to(device=pred_depth.device, dtype=pred_depth.dtype)
     pred_depth = pred_depth.to(torch.float32) * float(sample.normalization_scale or 1.0)
-    valid_mask = sample.point_masks.to(device=pred_depth.device).bool()
+    if sample.point_masks is not None:
+        valid_mask = sample.point_masks.to(device=pred_depth.device).bool()
+    elif sample.masks is not None:
+        valid_mask = sample.masks.to(device=pred_depth.device) > 0.5
+    else:
+        valid_mask = torch.ones_like(pred_depth, dtype=torch.bool, device=pred_depth.device)
 
     sample_seed = _sample_seed(sample.sample_id)
     pred_point_budget = int(sample.protocol.get("pred_point_sample_points", 20000))

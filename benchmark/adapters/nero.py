@@ -6,7 +6,7 @@ import struct
 import tarfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,42 @@ from PIL import Image
 
 from benchmark.adapters.base import BenchmarkDatasetAdapter, BenchmarkSample
 from benchmark.plan import DatasetSpec
+
+
+_PLY_NUMPY_DTYPE_MAP = {
+    "char": "i1",
+    "uchar": "u1",
+    "short": "i2",
+    "ushort": "u2",
+    "int": "i4",
+    "uint": "u4",
+    "float": "f4",
+    "float32": "f4",
+    "double": "f8",
+    "float64": "f8",
+}
+
+_COLMAP_CAMERA_MODELS = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+    5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12),
+    7: ("FOV", 5),
+    8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5),
+    10: ("THIN_PRISM_FISHEYE", 12),
+}
+
+_COLMAP_SINGLE_FOCAL_MODELS = {
+    "SIMPLE_PINHOLE",
+    "SIMPLE_RADIAL",
+    "RADIAL",
+    "SIMPLE_RADIAL_FISHEYE",
+    "RADIAL_FISHEYE",
+}
 
 
 def _to_homogeneous(extrinsics: torch.Tensor) -> torch.Tensor:
@@ -57,6 +93,34 @@ def _normalize_camera_extrinsics_and_points(
     return normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths
 
 
+def _normalize_camera_extrinsics_from_reference_points(
+    extrinsics: torch.Tensor,
+    reference_world_points: torch.Tensor,
+) -> Tuple[torch.Tensor, float]:
+    if extrinsics.ndim != 3 or extrinsics.shape[-2:] != (3, 4):
+        raise ValueError(f"Expected extrinsics with shape [N, 3, 4], got {tuple(extrinsics.shape)}")
+    if reference_world_points.ndim != 2 or reference_world_points.shape[-1] != 3:
+        raise ValueError(
+            "Expected reference_world_points with shape [M, 3], "
+            f"got {tuple(reference_world_points.shape)}"
+        )
+    if reference_world_points.shape[0] == 0:
+        raise ValueError("Cannot normalize NeRO GlossyReal cameras without reference 3D points.")
+
+    extrinsics_h = _to_homogeneous(extrinsics)
+    first_inv = torch.linalg.inv(extrinsics_h[:1]).expand(extrinsics_h.shape[0], -1, -1)
+    normalized_extrinsics_h = extrinsics_h @ first_inv
+
+    first_rotation = extrinsics[0, :3, :3]
+    first_translation = extrinsics[0, :3, 3]
+    reference_points_first_cam = reference_world_points @ first_rotation.transpose(-1, -2) + first_translation
+    avg_scale = float(reference_points_first_cam.norm(dim=-1).mean().clamp(min=1e-6, max=1e6).item())
+
+    normalized_extrinsics = normalized_extrinsics_h[:, :3].clone()
+    normalized_extrinsics[:, :3, 3] = normalized_extrinsics[:, :3, 3] / avg_scale
+    return normalized_extrinsics, avg_scale
+
+
 def _select_frame_ids(num_frames_total: int, num_frames_target: int, strategy: str) -> np.ndarray:
     if num_frames_target > num_frames_total:
         raise ValueError(
@@ -77,18 +141,6 @@ def _load_binary_point_ply(points_bytes: bytes) -> np.ndarray:
     vertex_count = None
     vertex_properties: List[Tuple[str, str]] = []
     reading_vertex_props = False
-    type_map = {
-        "char": "b",
-        "uchar": "B",
-        "short": "h",
-        "ushort": "H",
-        "int": "i",
-        "uint": "I",
-        "float": "f",
-        "float32": "f",
-        "double": "d",
-        "float64": "d",
-    }
 
     while True:
         line = file_obj.readline()
@@ -96,6 +148,8 @@ def _load_binary_point_ply(points_bytes: bytes) -> np.ndarray:
             raise ValueError("Unexpected EOF while reading NeRO PLY header.")
         decoded = line.decode("ascii", errors="strict").strip()
         if decoded == "ply" or decoded == "format binary_little_endian 1.0" or decoded.startswith("comment "):
+            continue
+        if decoded.startswith("obj_info "):
             continue
         if decoded.startswith("element vertex "):
             vertex_count = int(decoded.split()[2])
@@ -107,9 +161,9 @@ def _load_binary_point_ply(points_bytes: bytes) -> np.ndarray:
             continue
         if decoded.startswith("property ") and reading_vertex_props:
             _, prop_type, prop_name = decoded.split()
-            if prop_type not in type_map:
+            if prop_type not in _PLY_NUMPY_DTYPE_MAP:
                 raise ValueError(f"Unsupported PLY property type `{prop_type}`")
-            vertex_properties.append((prop_name, type_map[prop_type]))
+            vertex_properties.append((prop_name, "<" + _PLY_NUMPY_DTYPE_MAP[prop_type]))
             continue
         if decoded == "end_header":
             break
@@ -117,19 +171,12 @@ def _load_binary_point_ply(points_bytes: bytes) -> np.ndarray:
     if vertex_count is None or not vertex_properties:
         raise ValueError("NeRO PLY is missing vertex metadata.")
 
-    struct_fmt = "<" + "".join(fmt for _, fmt in vertex_properties)
-    struct_size = struct.calcsize(struct_fmt)
-    raw_rows = [struct.unpack(struct_fmt, file_obj.read(struct_size)) for _ in range(vertex_count)]
-    raw = np.asarray(raw_rows)
-    prop_names = [name for name, _ in vertex_properties]
-    xyz = np.stack(
-        [
-            raw[:, prop_names.index("x")],
-            raw[:, prop_names.index("y")],
-            raw[:, prop_names.index("z")],
-        ],
-        axis=-1,
-    )
+    vertex_dtype = np.dtype(vertex_properties)
+    vertices = np.frombuffer(points_bytes, dtype=vertex_dtype, count=vertex_count, offset=file_obj.tell())
+    required_props = ("x", "y", "z")
+    if any(prop not in vertices.dtype.names for prop in required_props):
+        raise ValueError("NeRO PLY does not contain XYZ vertex coordinates.")
+    xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=-1)
     return xyz.astype(np.float32, copy=False)
 
 
@@ -168,6 +215,163 @@ def _depth_to_cam_world_points(
     translation = extrinsic[:, 3]
     world_points = (cam_points - translation.reshape(1, 1, 3)) @ rotation
     return cam_points, world_points.astype(np.float32, copy=False), point_mask.astype(bool, copy=False)
+
+
+def _read_exact(file_obj: io.BytesIO, num_bytes: int) -> bytes:
+    data = file_obj.read(num_bytes)
+    if len(data) != num_bytes:
+        raise ValueError(f"Unexpected EOF while reading {num_bytes} bytes from COLMAP binary.")
+    return data
+
+
+def _read_null_terminated_string(file_obj: io.BytesIO) -> str:
+    chunks = bytearray()
+    while True:
+        char = file_obj.read(1)
+        if not char:
+            raise ValueError("Unexpected EOF while reading null-terminated COLMAP string.")
+        if char == b"\x00":
+            return chunks.decode("utf-8")
+        chunks.extend(char)
+
+
+def _qvec_to_rotation_matrix(qvec: np.ndarray) -> np.ndarray:
+    qw, qx, qy, qz = qvec.astype(np.float64, copy=False)
+    return np.array(
+        [
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qw * qz),
+                2.0 * (qx * qz + qw * qy),
+            ],
+            [
+                2.0 * (qx * qy + qw * qz),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qw * qx),
+            ],
+            [
+                2.0 * (qx * qz - qw * qy),
+                2.0 * (qy * qz + qw * qx),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _build_colmap_intrinsic_matrix(camera: Dict[str, object]) -> np.ndarray:
+    model_name = str(camera["model_name"])
+    params = np.asarray(camera["params"], dtype=np.float32)
+
+    if model_name in _COLMAP_SINGLE_FOCAL_MODELS:
+        if params.shape[0] < 3:
+            raise ValueError(f"COLMAP camera model `{model_name}` is missing focal/cx/cy parameters.")
+        fx = float(params[0])
+        fy = float(params[0])
+        cx = float(params[1])
+        cy = float(params[2])
+    else:
+        if params.shape[0] < 4:
+            raise ValueError(f"COLMAP camera model `{model_name}` is missing fx/fy/cx/cy parameters.")
+        fx = float(params[0])
+        fy = float(params[1])
+        cx = float(params[2])
+        cy = float(params[3])
+
+    intrinsic = np.eye(3, dtype=np.float32)
+    intrinsic[0, 0] = fx
+    intrinsic[1, 1] = fy
+    intrinsic[0, 2] = cx
+    intrinsic[1, 2] = cy
+    return intrinsic
+
+
+def _read_colmap_cameras(camera_bytes: bytes) -> Dict[int, Dict[str, object]]:
+    file_obj = io.BytesIO(camera_bytes)
+    num_cameras = struct.unpack("<Q", _read_exact(file_obj, 8))[0]
+    cameras: Dict[int, Dict[str, object]] = {}
+    for _ in range(num_cameras):
+        camera_id, model_id = struct.unpack("<ii", _read_exact(file_obj, 8))
+        width, height = struct.unpack("<QQ", _read_exact(file_obj, 16))
+        if model_id not in _COLMAP_CAMERA_MODELS:
+            raise ValueError(f"Unsupported COLMAP camera model id `{model_id}` in NeRO GlossyReal archive.")
+        model_name, num_params = _COLMAP_CAMERA_MODELS[model_id]
+        params = np.frombuffer(_read_exact(file_obj, 8 * num_params), dtype="<f8", count=num_params).astype(
+            np.float32,
+            copy=False,
+        )
+        cameras[camera_id] = {
+            "camera_id": camera_id,
+            "model_id": model_id,
+            "model_name": model_name,
+            "width": int(width),
+            "height": int(height),
+            "params": params,
+        }
+    return cameras
+
+
+def _read_colmap_images(image_bytes: bytes) -> List[Dict[str, object]]:
+    file_obj = io.BytesIO(image_bytes)
+    num_images = struct.unpack("<Q", _read_exact(file_obj, 8))[0]
+    point_dtype = np.dtype([("x", "<f8"), ("y", "<f8"), ("point3D_id", "<i8")])
+    images: List[Dict[str, object]] = []
+    for _ in range(num_images):
+        image_id = struct.unpack("<i", _read_exact(file_obj, 4))[0]
+        qvec = np.frombuffer(_read_exact(file_obj, 32), dtype="<f8", count=4)
+        tvec = np.frombuffer(_read_exact(file_obj, 24), dtype="<f8", count=3)
+        camera_id = struct.unpack("<i", _read_exact(file_obj, 4))[0]
+        name = _read_null_terminated_string(file_obj)
+        num_points2d = struct.unpack("<Q", _read_exact(file_obj, 8))[0]
+        if num_points2d > 0:
+            points2d = np.frombuffer(
+                _read_exact(file_obj, int(num_points2d) * point_dtype.itemsize),
+                dtype=point_dtype,
+                count=num_points2d,
+            )
+            point3d_ids = points2d["point3D_id"]
+            point3d_ids = point3d_ids[point3d_ids >= 0].astype(np.int64, copy=False)
+            point3d_ids = np.unique(point3d_ids)
+        else:
+            point3d_ids = np.empty((0,), dtype=np.int64)
+
+        rotation = _qvec_to_rotation_matrix(qvec)
+        extrinsic = np.concatenate([rotation, tvec.reshape(3, 1)], axis=1).astype(np.float32, copy=False)
+        images.append(
+            {
+                "image_id": image_id,
+                "camera_id": camera_id,
+                "name": name,
+                "extrinsic": extrinsic,
+                "point3d_ids": point3d_ids,
+            }
+        )
+    return images
+
+
+def _frame_sort_key(name: str) -> Tuple[int, int | str]:
+    stem = Path(name).stem
+    if stem.isdigit():
+        return 0, int(stem)
+    return 1, name
+
+
+def _shared_sparse_point_pairs(
+    frame_records: Sequence[Dict[str, object]],
+    min_shared_points: int,
+) -> List[List[int]]:
+    pair_indices: List[List[int]] = []
+    for i in range(len(frame_records)):
+        points_i = np.asarray(frame_records[i]["point3d_ids"], dtype=np.int64)
+        for j in range(i + 1, len(frame_records)):
+            points_j = np.asarray(frame_records[j]["point3d_ids"], dtype=np.int64)
+            if min_shared_points <= 0:
+                pair_indices.append([i, j])
+                continue
+            shared_count = int(np.intersect1d(points_i, points_j, assume_unique=True).size)
+            if shared_count >= min_shared_points:
+                pair_indices.append([i, j])
+    return pair_indices
 
 
 class NeROGlossySyntheticAdapter(BenchmarkDatasetAdapter):
@@ -253,7 +457,7 @@ class NeROGlossySyntheticAdapter(BenchmarkDatasetAdapter):
         tf: tarfile.TarFile,
         scene_name: str,
         frame_id: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         image_member = f"{self.subset}/{scene_name}/{frame_id}.png"
         depth_member = f"{self.subset}/{scene_name}/{frame_id}-depth.png"
         camera_member = f"{self.subset}/{scene_name}/{frame_id}-camera.pkl"
@@ -408,6 +612,215 @@ class NeROGlossySyntheticAdapter(BenchmarkDatasetAdapter):
                         "covisibility_min_visible_points": self.covisibility_min_visible_points,
                         "covisibility_depth_abs_tol": self.covisibility_depth_abs_tol,
                         "covisibility_depth_rel_tol": self.covisibility_depth_rel_tol,
+                        "small_translation_epsilon": self.small_translation_epsilon,
+                        "tsdf_resolution": self.tsdf_resolution,
+                        "tsdf_sdf_trunc_factor": self.tsdf_sdf_trunc_factor,
+                    },
+                )
+
+
+class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
+    def __init__(self, spec: DatasetSpec):
+        super().__init__(spec)
+        config = spec.config
+        archive_path = Path(config["data_path"]).expanduser()
+        if not archive_path.exists():
+            raise FileNotFoundError(f"NeRO benchmark archive not found: {archive_path}")
+
+        self.archive_path = archive_path
+        self.subset = str(config.get("subset", "GlossyReal"))
+        self.num_frames = int(config.get("num_frames", 16))
+        self.frame_selection = str(config.get("frame_selection", "evenly_spaced"))
+        self.image_size = int(config.get("img_size", 518))
+        self.max_scenes = config.get("max_scenes")
+        self.gt_point_sample_points = int(config.get("gt_point_sample_points", 20000))
+        self.pred_point_sample_points = int(config.get("pred_point_sample_points", 20000))
+        self.camera_min_shared_sparse_points = int(config.get("camera_min_shared_sparse_points", 16))
+        self.small_translation_epsilon = float(config.get("small_translation_epsilon", 1e-4))
+        self.tsdf_resolution = int(config.get("tsdf_resolution", 256))
+        self.tsdf_sdf_trunc_factor = float(config.get("tsdf_sdf_trunc_factor", 4.0))
+
+        requested_scene_names = config.get("scene_names")
+        self.scene_name_filter = set(requested_scene_names) if requested_scene_names is not None else None
+        self.scenes = self._index_archive()
+
+    def _index_archive(self) -> List[Dict[str, object]]:
+        scene_assets: Dict[str, Dict[str, object]] = defaultdict(
+            lambda: {
+                "image_members": {},
+                "cameras_member": None,
+                "images_member": None,
+                "gt_points_member": None,
+            }
+        )
+        with tarfile.open(self.archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                parts = member.name.split("/")
+                if len(parts) < 3 or parts[0] != self.subset:
+                    continue
+                scene_name = parts[1]
+                if self.scene_name_filter is not None and scene_name not in self.scene_name_filter:
+                    continue
+                relative_parts = parts[2:]
+
+                if relative_parts[:1] == ["images"] and len(relative_parts) == 2:
+                    filename = relative_parts[1]
+                    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                        scene_assets[scene_name]["image_members"][filename] = member.name
+                    continue
+                if relative_parts == ["colmap", "sparse", "0", "cameras.bin"]:
+                    scene_assets[scene_name]["cameras_member"] = member.name
+                    continue
+                if relative_parts == ["colmap", "sparse", "0", "images.bin"]:
+                    scene_assets[scene_name]["images_member"] = member.name
+                    continue
+                if relative_parts == ["colmap", "points.ply"]:
+                    scene_assets[scene_name]["gt_points_member"] = member.name
+
+            scenes: List[Dict[str, object]] = []
+            for scene_name in sorted(scene_assets):
+                assets = scene_assets[scene_name]
+                if (
+                    not assets["image_members"]
+                    or assets["cameras_member"] is None
+                    or assets["images_member"] is None
+                    or assets["gt_points_member"] is None
+                ):
+                    continue
+
+                cameras = _read_colmap_cameras(tf.extractfile(str(assets["cameras_member"])).read())
+                image_records = _read_colmap_images(tf.extractfile(str(assets["images_member"])).read())
+
+                indexed_frames: List[Dict[str, object]] = []
+                available_image_members = dict(assets["image_members"])
+                for image_record in sorted(image_records, key=lambda item: _frame_sort_key(str(item["name"]))):
+                    image_name = str(image_record["name"])
+                    if image_name not in available_image_members:
+                        continue
+                    camera_id = int(image_record["camera_id"])
+                    if camera_id not in cameras:
+                        continue
+                    indexed_frames.append(
+                        {
+                            "image_name": image_name,
+                            "image_member": available_image_members[image_name],
+                            "frame_id": int(Path(image_name).stem)
+                            if Path(image_name).stem.isdigit()
+                            else Path(image_name).stem,
+                            "extrinsic": np.asarray(image_record["extrinsic"], dtype=np.float32),
+                            "intrinsic": _build_colmap_intrinsic_matrix(cameras[camera_id]),
+                            "point3d_ids": np.asarray(image_record["point3d_ids"], dtype=np.int64),
+                        }
+                    )
+
+                if not indexed_frames:
+                    continue
+                scenes.append(
+                    {
+                        "name": scene_name,
+                        "frames": indexed_frames,
+                        "gt_points_member": assets["gt_points_member"],
+                    }
+                )
+
+        if self.max_scenes is not None:
+            scenes = scenes[: int(self.max_scenes)]
+        return scenes
+
+    def _load_scene_gt_points(self, tf: tarfile.TarFile, member_name: str) -> torch.Tensor:
+        points_bytes = tf.extractfile(member_name).read()
+        return torch.from_numpy(_load_binary_point_ply(points_bytes))
+
+    def _load_frame_image(
+        self,
+        tf: tarfile.TarFile,
+        image_member: str,
+        intrinsic: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        image_rgb = np.asarray(Image.open(io.BytesIO(tf.extractfile(image_member).read())).convert("RGB"))
+        resized_intrinsic = np.asarray(intrinsic, dtype=np.float32).copy()
+        if image_rgb.shape[0] != self.image_size or image_rgb.shape[1] != self.image_size:
+            src_h, src_w = image_rgb.shape[:2]
+            scale_x = self.image_size / float(src_w)
+            scale_y = self.image_size / float(src_h)
+            image_rgb = _resize_image_rgb(image_rgb, self.image_size)
+            resized_intrinsic[0, 0] *= scale_x
+            resized_intrinsic[1, 1] *= scale_y
+            resized_intrinsic[0, 2] *= scale_x
+            resized_intrinsic[1, 2] *= scale_y
+        return image_rgb.astype(np.uint8, copy=False), resized_intrinsic
+
+    def iter_samples(self) -> Iterator[BenchmarkSample]:
+        with tarfile.open(self.archive_path, "r:*") as tf:
+            for scene in self.scenes:
+                available_frames = list(scene["frames"])
+                selected_positions = _select_frame_ids(
+                    num_frames_total=len(available_frames),
+                    num_frames_target=self.num_frames,
+                    strategy=self.frame_selection,
+                )
+                selected_frames = [available_frames[int(idx)] for idx in selected_positions.tolist()]
+
+                images = []
+                intrinsics = []
+                extrinsics = []
+                frame_ids = []
+                frame_names = []
+                for frame in selected_frames:
+                    image, intrinsic = self._load_frame_image(
+                        tf=tf,
+                        image_member=str(frame["image_member"]),
+                        intrinsic=np.asarray(frame["intrinsic"], dtype=np.float32),
+                    )
+                    images.append(image)
+                    intrinsics.append(intrinsic)
+                    extrinsics.append(np.asarray(frame["extrinsic"], dtype=np.float32))
+                    frame_ids.append(frame["frame_id"])
+                    frame_names.append(str(frame["image_name"]))
+
+                image_tensor = torch.from_numpy(np.stack(images).astype(np.float32)).permute(0, 3, 1, 2) / 255.0
+                extrinsic_tensor = torch.from_numpy(np.stack(extrinsics).astype(np.float32))
+                intrinsic_tensor = torch.from_numpy(np.stack(intrinsics).astype(np.float32))
+
+                gt_points = self._load_scene_gt_points(tf, str(scene["gt_points_member"]))
+                normalized_extrinsics, avg_scale = _normalize_camera_extrinsics_from_reference_points(
+                    extrinsics=extrinsic_tensor,
+                    reference_world_points=gt_points.to(torch.float32),
+                )
+                camera_pair_indices = _shared_sparse_point_pairs(
+                    frame_records=selected_frames,
+                    min_shared_points=self.camera_min_shared_sparse_points,
+                )
+
+                sample_id = f"{self.subset}/{scene['name']}"
+                yield BenchmarkSample(
+                    sample_id=sample_id,
+                    images=image_tensor,
+                    masks=None,
+                    depths=None,
+                    cam_points=None,
+                    world_points=None,
+                    point_masks=None,
+                    extrinsics=normalized_extrinsics,
+                    intrinsics=intrinsic_tensor,
+                    raw_depths=None,
+                    raw_extrinsics=extrinsic_tensor,
+                    raw_intrinsics=intrinsic_tensor,
+                    normalization_scale=avg_scale,
+                    normalization_reference_extrinsic=extrinsic_tensor[0],
+                    gt_point_cloud=gt_points,
+                    metadata={
+                        "seq_name": str(scene["name"]),
+                        "frame_ids": frame_ids,
+                        "frame_names": frame_names,
+                    },
+                    protocol={
+                        "camera_pair_indices": camera_pair_indices,
+                        "camera_min_shared_sparse_points": self.camera_min_shared_sparse_points,
+                        "pred_point_sample_points": self.pred_point_sample_points,
+                        "gt_point_sample_points": self.gt_point_sample_points,
                         "small_translation_epsilon": self.small_translation_epsilon,
                         "tsdf_resolution": self.tsdf_resolution,
                         "tsdf_sdf_trunc_factor": self.tsdf_sdf_trunc_factor,

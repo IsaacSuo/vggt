@@ -26,6 +26,7 @@ instead of reusing `mode=val` from the training stack.
 
 - `openmaterial`
 - `nero_glossy_synthetic`
+- `nero_glossy_real`
 
 The OpenMaterial adapter reuses the existing dataset preprocessing path so images,
 masks, depths, and camera targets stay aligned with the current training semantics.
@@ -33,6 +34,12 @@ masks, depths, and camera targets stay aligned with the current training semanti
 The NeRO GlossySynthetic adapter reads the official `GlossySynthetic.tar.gz`
 release directly, uses per-frame `camera.pkl` and `depth.png`, and evaluates
 reconstruction against each scene's `eval_pts.ply` point cloud.
+
+The NeRO GlossyReal adapter reads `images/*.jpg` plus COLMAP metadata from the
+official `GlossyReal.tar.gz` release, uses COLMAP cameras as GT, filters camera
+pairs by shared sparse-track support from `images.bin`, and evaluates
+reconstruction against `colmap/points.ply`. Because GlossyReal does not provide
+per-frame GT depth, depth metrics are skipped for this dataset.
 
 ## OpenMaterial protocol
 
