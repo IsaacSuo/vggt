@@ -632,6 +632,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         self.num_frames = int(config.get("num_frames", 16))
         self.frame_selection = str(config.get("frame_selection", "evenly_spaced"))
         self.image_size = int(config.get("img_size", 518))
+        self.reconstruction_gt_source = str(config.get("reconstruction_gt_source", "object_point_cloud"))
         self.max_scenes = config.get("max_scenes")
         self.gt_point_sample_points = int(config.get("gt_point_sample_points", 20000))
         self.pred_point_sample_points = int(config.get("pred_point_sample_points", 20000))
@@ -651,6 +652,8 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 "cameras_member": None,
                 "images_member": None,
                 "gt_points_member": None,
+                "colmap_points_member": None,
+                "object_points_member": None,
             }
         )
         with tarfile.open(self.archive_path, "r:*") as tf:
@@ -677,16 +680,28 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     scene_assets[scene_name]["images_member"] = member.name
                     continue
                 if relative_parts == ["colmap", "points.ply"]:
-                    scene_assets[scene_name]["gt_points_member"] = member.name
+                    scene_assets[scene_name]["colmap_points_member"] = member.name
+                    continue
+                if relative_parts == ["object_point_cloud.ply"]:
+                    scene_assets[scene_name]["object_points_member"] = member.name
 
             scenes: List[Dict[str, object]] = []
             for scene_name in sorted(scene_assets):
                 assets = scene_assets[scene_name]
+                if self.reconstruction_gt_source == "object_point_cloud":
+                    gt_points_member = assets["object_points_member"]
+                elif self.reconstruction_gt_source == "colmap_points":
+                    gt_points_member = assets["colmap_points_member"]
+                else:
+                    raise ValueError(
+                        "Unsupported GlossyReal reconstruction_gt_source "
+                        f"`{self.reconstruction_gt_source}`. Expected `object_point_cloud` or `colmap_points`."
+                    )
                 if (
                     not assets["image_members"]
                     or assets["cameras_member"] is None
                     or assets["images_member"] is None
-                    or assets["gt_points_member"] is None
+                    or gt_points_member is None
                 ):
                     continue
 
@@ -721,7 +736,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     {
                         "name": scene_name,
                         "frames": indexed_frames,
-                        "gt_points_member": assets["gt_points_member"],
+                        "gt_points_member": gt_points_member,
                     }
                 )
 

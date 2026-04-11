@@ -250,7 +250,7 @@ def _binary_ply_vertices_with_color(ply_bytes: bytes) -> Tuple[np.ndarray, Optio
 
 def _load_gt_colors_from_archive(dataset_spec: DatasetSpec, scene_name: str) -> Optional[np.ndarray]:
     archive_path = Path(dataset_spec.config["data_path"]).expanduser()
-    member_name = f"GlossyReal/{scene_name}/colmap/points.ply"
+    member_name = f"GlossyReal/{scene_name}/object_point_cloud.ply"
     with tarfile.open(archive_path, "r:*") as tf:
         try:
             member = tf.getmember(member_name)

@@ -71,6 +71,7 @@
         "num_frames": 16,
         "frame_selection": "evenly_spaced",
         "img_size": 518,
+        "reconstruction_gt_source": "object_point_cloud",
         "camera_min_shared_sparse_points": 16,
         "pred_point_sample_points": 20000,
         "gt_point_sample_points": 20000,
