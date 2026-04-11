@@ -27,7 +27,7 @@ from benchmark.adapters.base import BenchmarkDatasetAdapter, BenchmarkSample
 from benchmark.plan import DatasetSpec
 
 
-_NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION = "v1"
+_NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION = "v2"
 _PLY_NUMPY_DTYPE_MAP = {
     "char": "i1",
     "uchar": "u1",
@@ -262,45 +262,19 @@ def _apply_similarity_transform(points: np.ndarray, transform: np.ndarray) -> np
     return points @ transform[:3, :3].T + transform[:3, 3]
 
 
-def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
-    union = np.count_nonzero(mask_a | mask_b)
-    if union == 0:
-        return 1.0
-    intersection = np.count_nonzero(mask_a & mask_b)
-    return float(intersection / union)
-
-
-def _score_mesh_alignment_transform(
+def _mesh_to_point_cloud_distance_summary(
     mesh_points: np.ndarray,
     transform: np.ndarray,
-    score_views: Sequence[Dict[str, object]],
-    point_radius: int,
-    dilation_kernel_size: int,
-    projection_trim_quantile: float,
-) -> Tuple[float, float, int]:
-    transformed_points = _apply_similarity_transform(mesh_points, transform).astype(np.float32, copy=False)
-    ious: List[float] = []
-    visible_pixels: List[int] = []
-
-    for view in score_views:
-        reference_mask = np.asarray(view["reference_mask"], dtype=bool)
-        if not np.any(reference_mask):
-            continue
-        candidate_mask = _project_object_points_to_mask(
-            points_world=transformed_points,
-            extrinsic=np.asarray(view["extrinsic"], dtype=np.float32),
-            intrinsic=np.asarray(view["intrinsic"], dtype=np.float32),
-            image_hw=tuple(view["image_hw"]),
-            point_radius=point_radius,
-            dilation_kernel_size=dilation_kernel_size,
-            projection_trim_quantile=projection_trim_quantile,
-        )
-        ious.append(_mask_iou(reference_mask, candidate_mask))
-        visible_pixels.append(int(candidate_mask.sum()))
-
-    if not ious:
-        return 0.0, 0.0, 0
-    return float(np.mean(ious)), float(np.min(ious)), int(np.min(visible_pixels))
+    target_points: np.ndarray,
+) -> Dict[str, float]:
+    transformed_points = _apply_similarity_transform(mesh_points, transform)
+    distances, _ = cKDTree(target_points).query(transformed_points, k=1)
+    return {
+        "mean": float(np.mean(distances)),
+        "median": float(np.median(distances)),
+        "p90": float(np.quantile(distances, 0.90)),
+        "p95": float(np.quantile(distances, 0.95)),
+    }
 
 
 def _nearest_distance_summary(source_points: np.ndarray, target_points: np.ndarray) -> Dict[str, float]:
@@ -874,8 +848,6 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         self.mesh_alignment_source_points = int(config.get("mesh_alignment_source_points", 12000))
         self.mesh_alignment_target_points = int(config.get("mesh_alignment_target_points", 12000))
         self.mesh_alignment_score_points = int(config.get("mesh_alignment_score_points", 50000))
-        self.mesh_alignment_score_frames = int(config.get("mesh_alignment_score_frames", 4))
-        self.mesh_alignment_score_image_size = int(config.get("mesh_alignment_score_image_size", 256))
         self.mesh_alignment_candidate_topk = int(config.get("mesh_alignment_candidate_topk", 6))
         self.mesh_alignment_icp_iterations = int(config.get("mesh_alignment_icp_iterations", 20))
         self.max_scenes = config.get("max_scenes")
@@ -1005,55 +977,11 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
             scenes = scenes[: int(self.max_scenes)]
         return scenes
 
-    def _build_mesh_alignment_score_views(
-        self,
-        object_points_world: np.ndarray,
-        extrinsics: Sequence[np.ndarray],
-        intrinsics: Sequence[np.ndarray],
-    ) -> List[Dict[str, object]]:
-        if len(extrinsics) != len(intrinsics):
-            raise ValueError("Extrinsics and intrinsics must have the same length for mesh alignment scoring.")
-        num_views = min(len(extrinsics), max(self.mesh_alignment_score_frames, 1))
-        selected_positions = _select_frame_ids(
-            num_frames_total=len(extrinsics),
-            num_frames_target=num_views,
-            strategy="evenly_spaced",
-        )
-        score_views: List[Dict[str, object]] = []
-        score_size = max(self.mesh_alignment_score_image_size, 1)
-        score_scale = score_size / float(self.image_size)
-        for idx in selected_positions.tolist():
-            extrinsic = np.asarray(extrinsics[int(idx)], dtype=np.float32)
-            intrinsic = np.asarray(intrinsics[int(idx)], dtype=np.float32).copy()
-            intrinsic[0, 0] *= score_scale
-            intrinsic[1, 1] *= score_scale
-            intrinsic[0, 2] *= score_scale
-            intrinsic[1, 2] *= score_scale
-            reference_mask = _project_object_points_to_mask(
-                points_world=object_points_world.astype(np.float32, copy=False),
-                extrinsic=extrinsic,
-                intrinsic=intrinsic,
-                image_hw=(score_size, score_size),
-                point_radius=self.object_mask_point_radius,
-                dilation_kernel_size=self.object_mask_dilation_kernel_size,
-                projection_trim_quantile=self.object_mask_projection_trim_quantile,
-            )
-            score_views.append(
-                {
-                    "extrinsic": extrinsic,
-                    "intrinsic": intrinsic,
-                    "image_hw": (score_size, score_size),
-                    "reference_mask": reference_mask,
-                }
-            )
-        return score_views
-
     def _estimate_mesh_alignment_transform(
         self,
         scene_name: str,
         mesh_vertices: np.ndarray,
         object_points_world: np.ndarray,
-        score_views: Sequence[Dict[str, object]],
     ) -> Tuple[np.ndarray, Dict[str, object]]:
         seed = _stable_seed_from_text(scene_name)
         source_points = _downsample_points_numpy(mesh_vertices, self.mesh_alignment_source_points, seed)
@@ -1066,20 +994,23 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         )
         candidate_scores = [
             (
-                _score_mesh_alignment_transform(
-                    mesh_points=score_points,
+                _mesh_to_point_cloud_distance_summary(
+                    mesh_points=score_points.astype(np.float64, copy=False),
                     transform=candidate,
-                    score_views=score_views,
-                    point_radius=self.object_mask_point_radius,
-                    dilation_kernel_size=self.object_mask_dilation_kernel_size,
-                    projection_trim_quantile=self.object_mask_projection_trim_quantile,
+                    target_points=target_points.astype(np.float64, copy=False),
                 ),
                 candidate,
             )
             for candidate in candidates
         ]
-        candidate_scores.sort(reverse=True, key=lambda item: item[0])
-        best_score, best_transform = candidate_scores[0]
+        candidate_scores.sort(
+            key=lambda item: (
+                item[0]["median"],
+                item[0]["p90"],
+                item[0]["mean"],
+            )
+        )
+        best_stats, best_transform = candidate_scores[0]
 
         topk = max(1, min(self.mesh_alignment_candidate_topk, len(candidate_scores)))
         for _, candidate in candidate_scores[:topk]:
@@ -1093,16 +1024,21 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 scale=True,
                 translation=True,
             )
-            refined_score = _score_mesh_alignment_transform(
+            refined_stats = _mesh_to_point_cloud_distance_summary(
                 mesh_points=score_points,
                 transform=refined_transform,
-                score_views=score_views,
-                point_radius=self.object_mask_point_radius,
-                dilation_kernel_size=self.object_mask_dilation_kernel_size,
-                projection_trim_quantile=self.object_mask_projection_trim_quantile,
+                target_points=target_points.astype(np.float64, copy=False),
             )
-            if refined_score > best_score:
-                best_score = refined_score
+            if (
+                refined_stats["median"],
+                refined_stats["p90"],
+                refined_stats["mean"],
+            ) < (
+                best_stats["median"],
+                best_stats["p90"],
+                best_stats["mean"],
+            ):
+                best_stats = refined_stats
                 best_transform = refined_transform
 
         coarse_nn = _nearest_distance_summary(
@@ -1110,9 +1046,10 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
             target_points.astype(np.float64, copy=False),
         )
         return best_transform.astype(np.float64, copy=False), {
-            "score_mean_iou": float(best_score[0]),
-            "score_min_iou": float(best_score[1]),
-            "score_min_visible_pixels": int(best_score[2]),
+            "mesh_to_object_mean": best_stats["mean"],
+            "mesh_to_object_median": best_stats["median"],
+            "mesh_to_object_p90": best_stats["p90"],
+            "mesh_to_object_p95": best_stats["p95"],
             "nn_mean": coarse_nn["mean"],
             "nn_median": coarse_nn["median"],
             "nn_p95": coarse_nn["p95"],
@@ -1123,8 +1060,6 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         scene_name: str,
         mesh_member: str,
         object_points_world: np.ndarray,
-        extrinsics: Sequence[np.ndarray],
-        intrinsics: Sequence[np.ndarray],
     ) -> Tuple[Path, np.ndarray, Dict[str, object]]:
         raw_mesh_path = _extract_zip_member(
             zip_path=self.mesh_gt_zip_path,
@@ -1143,16 +1078,10 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
 
         mesh = _load_trimesh_mesh(raw_mesh_path)
         mesh_vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        score_views = self._build_mesh_alignment_score_views(
-            object_points_world=object_points_world,
-            extrinsics=extrinsics,
-            intrinsics=intrinsics,
-        )
         transform, stats = self._estimate_mesh_alignment_transform(
             scene_name=scene_name,
             mesh_vertices=mesh_vertices,
             object_points_world=object_points_world,
-            score_views=score_views,
         )
         aligned_vertices = _export_aligned_mesh(mesh, transform, aligned_mesh_path)
         stats = dict(stats)
@@ -1241,8 +1170,6 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                         scene_name=str(scene["name"]),
                         mesh_member=str(mesh_member),
                         object_points_world=object_points_np,
-                        extrinsics=extrinsics,
-                        intrinsics=intrinsics,
                     )
                     gt_mesh_path = str(mesh_path)
                     gt_points = torch.from_numpy(aligned_vertices)
