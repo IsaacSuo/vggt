@@ -12,6 +12,54 @@
       },
       "strict": false,
       "use_visual_hull_mask": true
+    },
+    {
+      "name": "lora_openmaterial",
+      "checkpoint_path": "/opt/data/private/fyp/vggt_runs/train_disjoint_mem/ckpts/checkpoint.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true,
+      "lora": {
+        "rank": 32,
+        "alpha": 32.0,
+        "dropout": 0.05,
+        "target_modules": [
+          "qkv"
+        ],
+        "target_block_type": "global",
+        "block_indices": null,
+        "freeze_base": false,
+        "merge_after_load": false
+      }
+    },
+    {
+      "name": "lora_openmaterial_few_frames",
+      "checkpoint_path": "/opt/data/private/fyp/vggt_runs/train_disjoint/ckpts/checkpoint.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true,
+      "lora": {
+        "rank": 32,
+        "alpha": 32.0,
+        "dropout": 0.05,
+        "target_modules": [
+          "qkv"
+        ],
+        "target_block_type": "global",
+        "block_indices": null,
+        "freeze_base": false,
+        "merge_after_load": false
+      }
     }
   ],
   "datasets": [
