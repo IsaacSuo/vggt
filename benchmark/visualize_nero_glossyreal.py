@@ -379,22 +379,19 @@ def _project_points(
     points_world: np.ndarray,
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     camera_points = points_world @ extrinsic[:, :3].T + extrinsic[:, 3]
     depth = camera_points[:, 2]
     positive = depth > 1e-8
-    if not np.any(positive):
-        return (
-            np.empty((0,), dtype=np.int32),
-            np.empty((0,), dtype=np.int32),
-            np.empty((0,), dtype=np.float32),
-        )
-
-    camera_points = camera_points[positive]
-    depth = depth[positive]
-    u = intrinsic[0, 0] * (camera_points[:, 0] / depth) + intrinsic[0, 2]
-    v = intrinsic[1, 1] * (camera_points[:, 1] / depth) + intrinsic[1, 2]
-    return u, v, depth
+    z_safe = np.where(positive, depth, 1.0).astype(np.float32, copy=False)
+    u = intrinsic[0, 0] * (camera_points[:, 0] / z_safe) + intrinsic[0, 2]
+    v = intrinsic[1, 1] * (camera_points[:, 1] / z_safe) + intrinsic[1, 2]
+    return (
+        u.astype(np.float32, copy=False),
+        v.astype(np.float32, copy=False),
+        depth.astype(np.float32, copy=False),
+        positive,
+    )
 
 
 def _render_projected_point_cloud(
@@ -414,9 +411,14 @@ def _render_projected_point_cloud(
     if points_world.shape[0] == 0:
         return canvas, depth_buffer
 
-    u, v, depth = _project_points(points_world, extrinsic, intrinsic)
-    if depth.size == 0:
+    u, v, depth, positive = _project_points(points_world, extrinsic, intrinsic)
+    if not np.any(positive):
         return canvas, depth_buffer
+
+    colors = colors[positive].astype(np.float32, copy=False)
+    u = u[positive]
+    v = v[positive]
+    depth = depth[positive]
 
     x = np.rint(u).astype(np.int32)
     y = np.rint(v).astype(np.int32)
@@ -516,10 +518,13 @@ def _crop_box_from_projected_points(
     trim_quantile: float = 0.01,
 ) -> Tuple[int, int, int, int]:
     height, width = image_size_hw
-    u, v, depth = _project_points(points_world, extrinsic, intrinsic)
-    if depth.size == 0:
+    u, v, depth, positive = _project_points(points_world, extrinsic, intrinsic)
+    if not np.any(positive):
         return 0, 0, width, height
 
+    u = u[positive]
+    v = v[positive]
+    depth = depth[positive]
     in_bounds = (u >= 0.0) & (u < width) & (v >= 0.0) & (v < height)
     if not np.any(in_bounds):
         return 0, 0, width, height
