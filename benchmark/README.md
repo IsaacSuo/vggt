@@ -38,10 +38,12 @@ reconstruction against each scene's `eval_pts.ply` point cloud.
 The NeRO GlossyReal adapter reads `images/*.jpg` plus COLMAP metadata from the
 official `GlossyReal.tar.gz` release, uses COLMAP cameras as GT, filters camera
 pairs by shared sparse-track support from `images.bin`, and evaluates
-reconstruction against each scene's `object_point_cloud.ply`. For object-level
-reconstruction filtering, it projects `object_point_cloud.ply` into each selected
-frame to build benchmark masks, then applies those masks before TSDF fusion.
-Because GlossyReal does not provide
+reconstruction against the mesh GT from `glossy-real-meshes-gt.zip` after
+automatically aligning each mesh into the COLMAP/object world frame using
+`object_point_cloud.ply` as an alignment reference. For object-level
+reconstruction filtering, it projects the aligned mesh vertices into each
+selected frame to build benchmark masks, then applies those masks before TSDF
+fusion. Because GlossyReal does not provide
 per-frame GT depth, depth metrics are skipped for this dataset.
 
 ## OpenMaterial protocol

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import io
+import itertools
 import pickle
 import struct
 import tarfile
+import tempfile
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterator, List, Sequence, Tuple
@@ -12,11 +16,18 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.spatial import cKDTree
+
+try:
+    import trimesh
+except ImportError:  # pragma: no cover - optional dependency for GlossyReal mesh GT only
+    trimesh = None
 
 from benchmark.adapters.base import BenchmarkDatasetAdapter, BenchmarkSample
 from benchmark.plan import DatasetSpec
 
 
+_NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION = "v1"
 _PLY_NUMPY_DTYPE_MAP = {
     "char": "i1",
     "uchar": "u1",
@@ -178,6 +189,151 @@ def _load_binary_point_ply(points_bytes: bytes) -> np.ndarray:
         raise ValueError("NeRO PLY does not contain XYZ vertex coordinates.")
     xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=-1)
     return xyz.astype(np.float32, copy=False)
+
+
+def _extract_zip_member(zip_path: Path, member_name: str, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        return output_path
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        with zf.open(member_name, "r") as src, output_path.open("wb") as dst:
+            dst.write(src.read())
+    return output_path
+
+
+def _stable_seed_from_text(text: str) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def _downsample_points_numpy(points: np.ndarray, max_points: int, seed: int) -> np.ndarray:
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError(f"Expected point array with shape [N, 3], got {tuple(points.shape)}")
+    if max_points <= 0 or points.shape[0] <= max_points:
+        return points
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(points.shape[0], size=max_points, replace=False)
+    return points[indices]
+
+
+def _principal_axes_basis(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError(f"Expected point array with shape [N, 3], got {tuple(points.shape)}")
+    if points.shape[0] < 3:
+        raise ValueError("Need at least three points to estimate a principal-axis basis.")
+
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    covariance = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+    if np.linalg.det(eigenvectors) < 0:
+        eigenvectors[:, -1] *= -1
+    scales = np.sqrt(np.maximum(eigenvalues, 1e-12))
+    return centroid, eigenvectors, scales
+
+
+def _candidate_similarity_transforms_from_pca(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+) -> List[np.ndarray]:
+    source_centroid, source_basis, source_scales = _principal_axes_basis(source_points)
+    target_centroid, target_basis, target_scales = _principal_axes_basis(target_points)
+
+    transforms: List[np.ndarray] = []
+    for perm in itertools.permutations(range(3)):
+        perm_matrix = np.eye(3, dtype=np.float64)[:, perm]
+        perm_scales = source_scales[list(perm)]
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            sign_matrix = np.diag(np.asarray(signs, dtype=np.float64))
+            rotation = target_basis @ perm_matrix @ sign_matrix @ source_basis.T
+            scale = float(np.mean(target_scales / perm_scales))
+            transform = np.eye(4, dtype=np.float64)
+            transform[:3, :3] = scale * rotation
+            transform[:3, 3] = target_centroid - scale * (rotation @ source_centroid)
+            transforms.append(transform)
+    return transforms
+
+
+def _apply_similarity_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    return points @ transform[:3, :3].T + transform[:3, 3]
+
+
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    union = np.count_nonzero(mask_a | mask_b)
+    if union == 0:
+        return 1.0
+    intersection = np.count_nonzero(mask_a & mask_b)
+    return float(intersection / union)
+
+
+def _score_mesh_alignment_transform(
+    mesh_points: np.ndarray,
+    transform: np.ndarray,
+    score_views: Sequence[Dict[str, object]],
+    point_radius: int,
+    dilation_kernel_size: int,
+    projection_trim_quantile: float,
+) -> Tuple[float, float, int]:
+    transformed_points = _apply_similarity_transform(mesh_points, transform).astype(np.float32, copy=False)
+    ious: List[float] = []
+    visible_pixels: List[int] = []
+
+    for view in score_views:
+        reference_mask = np.asarray(view["reference_mask"], dtype=bool)
+        if not np.any(reference_mask):
+            continue
+        candidate_mask = _project_object_points_to_mask(
+            points_world=transformed_points,
+            extrinsic=np.asarray(view["extrinsic"], dtype=np.float32),
+            intrinsic=np.asarray(view["intrinsic"], dtype=np.float32),
+            image_hw=tuple(view["image_hw"]),
+            point_radius=point_radius,
+            dilation_kernel_size=dilation_kernel_size,
+            projection_trim_quantile=projection_trim_quantile,
+        )
+        ious.append(_mask_iou(reference_mask, candidate_mask))
+        visible_pixels.append(int(candidate_mask.sum()))
+
+    if not ious:
+        return 0.0, 0.0, 0
+    return float(np.mean(ious)), float(np.min(ious)), int(np.min(visible_pixels))
+
+
+def _nearest_distance_summary(source_points: np.ndarray, target_points: np.ndarray) -> Dict[str, float]:
+    if source_points.shape[0] == 0 or target_points.shape[0] == 0:
+        return {"mean": float("inf"), "median": float("inf"), "p95": float("inf")}
+    distances, _ = cKDTree(target_points).query(source_points, k=1)
+    return {
+        "mean": float(np.mean(distances)),
+        "median": float(np.median(distances)),
+        "p95": float(np.quantile(distances, 0.95)),
+    }
+
+
+def _load_trimesh_mesh(mesh_path: Path):
+    if trimesh is None:
+        raise ImportError(
+            "NeRO GlossyReal mesh GT requires `trimesh`. Install it in the current environment "
+            "before using reconstruction_gt_source=`mesh_gt_zip`."
+        )
+    mesh = trimesh.load(mesh_path, file_type="ply", force="mesh", process=False)
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"Expected a triangular mesh from {mesh_path}, got {type(mesh).__name__}.")
+    if mesh.vertices is None or len(mesh.vertices) == 0 or mesh.faces is None or len(mesh.faces) == 0:
+        raise ValueError(f"Mesh GT at {mesh_path} does not contain vertices/faces.")
+    return mesh
+
+
+def _export_aligned_mesh(mesh, transform: np.ndarray, output_path: Path) -> np.ndarray:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    aligned_mesh = mesh.copy()
+    aligned_mesh.apply_transform(transform)
+    aligned_mesh.export(output_path, file_type="ply")
+    return np.asarray(aligned_mesh.vertices, dtype=np.float32)
 
 
 def _resize_image_rgb(image_rgb: np.ndarray, image_size: int) -> np.ndarray:
@@ -397,6 +553,11 @@ def _project_object_points_to_mask(
     depth = depth[valid]
     u = intrinsic[0, 0] * (cam_points[:, 0] / depth) + intrinsic[0, 2]
     v = intrinsic[1, 1] * (cam_points[:, 1] / depth) + intrinsic[1, 2]
+    finite = np.isfinite(u) & np.isfinite(v)
+    if not np.any(finite):
+        return np.zeros((height, width), dtype=bool)
+    u = u[finite]
+    v = v[finite]
     x = np.rint(u).astype(np.int32)
     y = np.rint(v).astype(np.int32)
     in_bounds = (x >= 0) & (x < width) & (y >= 0) & (y < height)
@@ -699,7 +860,24 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
         self.num_frames = int(config.get("num_frames", 16))
         self.frame_selection = str(config.get("frame_selection", "evenly_spaced"))
         self.image_size = int(config.get("img_size", 518))
-        self.reconstruction_gt_source = str(config.get("reconstruction_gt_source", "object_point_cloud"))
+        self.reconstruction_gt_source = str(config.get("reconstruction_gt_source", "mesh_gt_zip"))
+        mesh_gt_zip_path = config.get("mesh_gt_zip_path")
+        if mesh_gt_zip_path is None:
+            mesh_gt_zip_path = archive_path.parent / "glossy-real-meshes-gt.zip"
+        self.mesh_gt_zip_path = Path(mesh_gt_zip_path).expanduser()
+        self.mesh_extract_root = Path(
+            config.get(
+                "mesh_extract_root",
+                Path(tempfile.gettempdir()) / "vggt_benchmark_nero_glossyreal_meshes",
+            )
+        ).expanduser()
+        self.mesh_alignment_source_points = int(config.get("mesh_alignment_source_points", 12000))
+        self.mesh_alignment_target_points = int(config.get("mesh_alignment_target_points", 12000))
+        self.mesh_alignment_score_points = int(config.get("mesh_alignment_score_points", 50000))
+        self.mesh_alignment_score_frames = int(config.get("mesh_alignment_score_frames", 4))
+        self.mesh_alignment_score_image_size = int(config.get("mesh_alignment_score_image_size", 256))
+        self.mesh_alignment_candidate_topk = int(config.get("mesh_alignment_candidate_topk", 6))
+        self.mesh_alignment_icp_iterations = int(config.get("mesh_alignment_icp_iterations", 20))
         self.max_scenes = config.get("max_scenes")
         self.gt_point_sample_points = int(config.get("gt_point_sample_points", 20000))
         self.pred_point_sample_points = int(config.get("pred_point_sample_points", 20000))
@@ -724,6 +902,7 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 "gt_points_member": None,
                 "colmap_points_member": None,
                 "object_points_member": None,
+                "mesh_member": None,
             }
         )
         with tarfile.open(self.archive_path, "r:*") as tf:
@@ -755,17 +934,27 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 if relative_parts == ["object_point_cloud.ply"]:
                     scene_assets[scene_name]["object_points_member"] = member.name
 
+            if self.mesh_gt_zip_path.exists():
+                with zipfile.ZipFile(self.mesh_gt_zip_path, "r") as zf:
+                    zip_names = set(zf.namelist())
+                for scene_name in scene_assets:
+                    mesh_member = f"{scene_name}-align.ply"
+                    if mesh_member in zip_names:
+                        scene_assets[scene_name]["mesh_member"] = mesh_member
+
             scenes: List[Dict[str, object]] = []
             for scene_name in sorted(scene_assets):
                 assets = scene_assets[scene_name]
-                if self.reconstruction_gt_source == "object_point_cloud":
+                if self.reconstruction_gt_source == "mesh_gt_zip":
+                    gt_points_member = assets["mesh_member"]
+                elif self.reconstruction_gt_source == "object_point_cloud":
                     gt_points_member = assets["object_points_member"]
                 elif self.reconstruction_gt_source == "colmap_points":
                     gt_points_member = assets["colmap_points_member"]
                 else:
                     raise ValueError(
                         "Unsupported GlossyReal reconstruction_gt_source "
-                        f"`{self.reconstruction_gt_source}`. Expected `object_point_cloud` or `colmap_points`."
+                        f"`{self.reconstruction_gt_source}`. Expected `mesh_gt_zip`, `object_point_cloud` or `colmap_points`."
                     )
                 if (
                     not assets["image_members"]
@@ -808,12 +997,167 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                         "frames": indexed_frames,
                         "gt_points_member": gt_points_member,
                         "object_points_member": assets["object_points_member"],
+                        "mesh_member": assets["mesh_member"],
                     }
                 )
 
         if self.max_scenes is not None:
             scenes = scenes[: int(self.max_scenes)]
         return scenes
+
+    def _build_mesh_alignment_score_views(
+        self,
+        object_points_world: np.ndarray,
+        extrinsics: Sequence[np.ndarray],
+        intrinsics: Sequence[np.ndarray],
+    ) -> List[Dict[str, object]]:
+        if len(extrinsics) != len(intrinsics):
+            raise ValueError("Extrinsics and intrinsics must have the same length for mesh alignment scoring.")
+        num_views = min(len(extrinsics), max(self.mesh_alignment_score_frames, 1))
+        selected_positions = _select_frame_ids(
+            num_frames_total=len(extrinsics),
+            num_frames_target=num_views,
+            strategy="evenly_spaced",
+        )
+        score_views: List[Dict[str, object]] = []
+        score_size = max(self.mesh_alignment_score_image_size, 1)
+        score_scale = score_size / float(self.image_size)
+        for idx in selected_positions.tolist():
+            extrinsic = np.asarray(extrinsics[int(idx)], dtype=np.float32)
+            intrinsic = np.asarray(intrinsics[int(idx)], dtype=np.float32).copy()
+            intrinsic[0, 0] *= score_scale
+            intrinsic[1, 1] *= score_scale
+            intrinsic[0, 2] *= score_scale
+            intrinsic[1, 2] *= score_scale
+            reference_mask = _project_object_points_to_mask(
+                points_world=object_points_world.astype(np.float32, copy=False),
+                extrinsic=extrinsic,
+                intrinsic=intrinsic,
+                image_hw=(score_size, score_size),
+                point_radius=self.object_mask_point_radius,
+                dilation_kernel_size=self.object_mask_dilation_kernel_size,
+                projection_trim_quantile=self.object_mask_projection_trim_quantile,
+            )
+            score_views.append(
+                {
+                    "extrinsic": extrinsic,
+                    "intrinsic": intrinsic,
+                    "image_hw": (score_size, score_size),
+                    "reference_mask": reference_mask,
+                }
+            )
+        return score_views
+
+    def _estimate_mesh_alignment_transform(
+        self,
+        scene_name: str,
+        mesh_vertices: np.ndarray,
+        object_points_world: np.ndarray,
+        score_views: Sequence[Dict[str, object]],
+    ) -> Tuple[np.ndarray, Dict[str, object]]:
+        seed = _stable_seed_from_text(scene_name)
+        source_points = _downsample_points_numpy(mesh_vertices, self.mesh_alignment_source_points, seed)
+        target_points = _downsample_points_numpy(object_points_world, self.mesh_alignment_target_points, seed + 1)
+        score_points = _downsample_points_numpy(mesh_vertices, self.mesh_alignment_score_points, seed + 2)
+
+        candidates = _candidate_similarity_transforms_from_pca(
+            source_points=source_points.astype(np.float64, copy=False),
+            target_points=target_points.astype(np.float64, copy=False),
+        )
+        candidate_scores = [
+            (
+                _score_mesh_alignment_transform(
+                    mesh_points=score_points,
+                    transform=candidate,
+                    score_views=score_views,
+                    point_radius=self.object_mask_point_radius,
+                    dilation_kernel_size=self.object_mask_dilation_kernel_size,
+                    projection_trim_quantile=self.object_mask_projection_trim_quantile,
+                ),
+                candidate,
+            )
+            for candidate in candidates
+        ]
+        candidate_scores.sort(reverse=True, key=lambda item: item[0])
+        best_score, best_transform = candidate_scores[0]
+
+        topk = max(1, min(self.mesh_alignment_candidate_topk, len(candidate_scores)))
+        for _, candidate in candidate_scores[:topk]:
+            refined_transform, _, _ = trimesh.registration.icp(
+                source_points.astype(np.float64, copy=False),
+                target_points.astype(np.float64, copy=False),
+                initial=candidate,
+                threshold=1e-6,
+                max_iterations=self.mesh_alignment_icp_iterations,
+                reflection=True,
+                scale=True,
+                translation=True,
+            )
+            refined_score = _score_mesh_alignment_transform(
+                mesh_points=score_points,
+                transform=refined_transform,
+                score_views=score_views,
+                point_radius=self.object_mask_point_radius,
+                dilation_kernel_size=self.object_mask_dilation_kernel_size,
+                projection_trim_quantile=self.object_mask_projection_trim_quantile,
+            )
+            if refined_score > best_score:
+                best_score = refined_score
+                best_transform = refined_transform
+
+        coarse_nn = _nearest_distance_summary(
+            _apply_similarity_transform(source_points.astype(np.float64, copy=False), best_transform),
+            target_points.astype(np.float64, copy=False),
+        )
+        return best_transform.astype(np.float64, copy=False), {
+            "score_mean_iou": float(best_score[0]),
+            "score_min_iou": float(best_score[1]),
+            "score_min_visible_pixels": int(best_score[2]),
+            "nn_mean": coarse_nn["mean"],
+            "nn_median": coarse_nn["median"],
+            "nn_p95": coarse_nn["p95"],
+        }
+
+    def _prepare_world_aligned_mesh(
+        self,
+        scene_name: str,
+        mesh_member: str,
+        object_points_world: np.ndarray,
+        extrinsics: Sequence[np.ndarray],
+        intrinsics: Sequence[np.ndarray],
+    ) -> Tuple[Path, np.ndarray, Dict[str, object]]:
+        raw_mesh_path = _extract_zip_member(
+            zip_path=self.mesh_gt_zip_path,
+            member_name=mesh_member,
+            output_path=self.mesh_extract_root / "raw" / mesh_member,
+        )
+        aligned_mesh_path = (
+            self.mesh_extract_root
+            / "aligned"
+            / _NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION
+            / f"{scene_name}-colmap-world.ply"
+        )
+        if aligned_mesh_path.exists():
+            aligned_vertices = _load_binary_point_ply(aligned_mesh_path.read_bytes())
+            return aligned_mesh_path, aligned_vertices, {"cache_hit": True}
+
+        mesh = _load_trimesh_mesh(raw_mesh_path)
+        mesh_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        score_views = self._build_mesh_alignment_score_views(
+            object_points_world=object_points_world,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+        )
+        transform, stats = self._estimate_mesh_alignment_transform(
+            scene_name=scene_name,
+            mesh_vertices=mesh_vertices,
+            object_points_world=object_points_world,
+            score_views=score_views,
+        )
+        aligned_vertices = _export_aligned_mesh(mesh, transform, aligned_mesh_path)
+        stats = dict(stats)
+        stats["cache_hit"] = False
+        return aligned_mesh_path, aligned_vertices, stats
 
     def _load_scene_gt_points(self, tf: tarfile.TarFile, member_name: str) -> torch.Tensor:
         points_bytes = tf.extractfile(member_name).read()
@@ -869,14 +1213,46 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 image_tensor = torch.from_numpy(np.stack(images).astype(np.float32)).permute(0, 3, 1, 2) / 255.0
                 extrinsic_tensor = torch.from_numpy(np.stack(extrinsics).astype(np.float32))
                 intrinsic_tensor = torch.from_numpy(np.stack(intrinsics).astype(np.float32))
-
-                gt_points = self._load_scene_gt_points(tf, str(scene["gt_points_member"]))
                 object_points_member = scene.get("object_points_member")
                 object_points = (
                     self._load_scene_gt_points(tf, str(object_points_member))
                     if object_points_member is not None
-                    else gt_points
+                    else None
                 )
+                object_points_np = (
+                    object_points.cpu().numpy().astype(np.float32, copy=False)
+                    if object_points is not None
+                    else None
+                )
+
+                gt_mesh_path = None
+                if self.reconstruction_gt_source == "mesh_gt_zip":
+                    mesh_member = scene.get("mesh_member")
+                    if mesh_member is None:
+                        raise FileNotFoundError(
+                            f"Mesh GT for scene `{scene['name']}` was not found in {self.mesh_gt_zip_path}."
+                        )
+                    if object_points_np is None:
+                        raise ValueError(
+                            f"Scene `{scene['name']}` is missing object_point_cloud.ply, "
+                            "which is required to align mesh GT into COLMAP world coordinates."
+                        )
+                    mesh_path, aligned_vertices, alignment_stats = self._prepare_world_aligned_mesh(
+                        scene_name=str(scene["name"]),
+                        mesh_member=str(mesh_member),
+                        object_points_world=object_points_np,
+                        extrinsics=extrinsics,
+                        intrinsics=intrinsics,
+                    )
+                    gt_mesh_path = str(mesh_path)
+                    gt_points = torch.from_numpy(aligned_vertices)
+                    object_points_np = aligned_vertices
+                else:
+                    gt_points = self._load_scene_gt_points(tf, str(scene["gt_points_member"]))
+                    if object_points is None:
+                        object_points = gt_points
+                        object_points_np = gt_points.cpu().numpy().astype(np.float32, copy=False)
+                    alignment_stats = None
                 normalized_extrinsics, avg_scale = _normalize_camera_extrinsics_from_reference_points(
                     extrinsics=extrinsic_tensor,
                     reference_world_points=gt_points.to(torch.float32),
@@ -886,7 +1262,6 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     min_shared_points=self.camera_min_shared_sparse_points,
                 )
                 object_masks = []
-                object_points_np = object_points.cpu().numpy().astype(np.float32, copy=False)
                 for extrinsic, intrinsic in zip(extrinsics, intrinsics):
                     object_mask = _project_object_points_to_mask(
                         points_world=object_points_np,
@@ -920,12 +1295,14 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     raw_intrinsics=intrinsic_tensor,
                     normalization_scale=avg_scale,
                     normalization_reference_extrinsic=extrinsic_tensor[0],
-                    gt_point_cloud=gt_points,
+                    gt_mesh_path=gt_mesh_path,
+                    gt_point_cloud=None if gt_mesh_path is not None else gt_points,
                     metadata={
                         "seq_name": str(scene["name"]),
                         "frame_ids": frame_ids,
                         "frame_names": frame_names,
                         "object_mask_coverage": object_mask_coverage,
+                        "mesh_alignment": alignment_stats,
                     },
                     protocol={
                         "camera_pair_indices": camera_pair_indices,
