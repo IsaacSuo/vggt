@@ -508,6 +508,7 @@ Operational note from server bring-up:
   - `benchmark/model_loader.py`: explicit checkpoint + LoRA loading
   - `benchmark/adapters/`: dataset adapters
   - `benchmark/examples/openmaterial_scene_disjoint_plan.json`: reference plan format
+  - `benchmark/examples/nero_glossysynthetic_plan.json`: local reference plan for NeRO GlossySynthetic
 - the benchmark design assumes explicit model specs and dataset adapters instead of reusing Hydra train configs as the primary evaluation interface
 - the OpenMaterial standalone benchmark protocol is now:
   - scene-level evaluation with macro-average aggregation
@@ -518,6 +519,11 @@ Operational note from server bring-up:
   - report `CD-L1` normalized by the GT mesh bbox diagonal plus `F1@1%` and `F1@5%` using bbox-diagonal thresholds
   - do not treat predicted `world_points` as the final reconstruction protocol
 - if the OpenMaterial dataset tree does not already contain `depth_mesh/*.npy`, standalone benchmark runs may hit online CPU mesh rasterization through the dataset adapter; for real runs, precompute caches first with `training/data/preprocess/openmaterial_depth_cache.py`
+- the standalone benchmark now also has a `nero_glossy_synthetic` adapter
+  - it reads the official `GlossySynthetic.tar.gz` release directly without requiring manual extraction
+  - each scene provides RGB images, uint16 depth maps, `camera.pkl`, and `eval_pts.ply`
+  - GT geometry is point-cloud based (`eval_pts.ply`), so the benchmark reconstruction path was generalized to support GT point clouds in addition to GT meshes
+  - the current adapter default assumes `depth_scale=5000.0` for the uint16 depth PNGs; keep that configurable in the plan rather than hard-coding it elsewhere
 
 ## 11. Fork-Specific Mechanisms
 
