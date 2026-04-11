@@ -177,6 +177,7 @@ def download_nero_all(output_root: Path) -> Path:
         output=str(target_root),
         quiet=False,
         remaining_ok=True,
+        resume=True,
     )
     return target_root
 
