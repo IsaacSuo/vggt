@@ -82,6 +82,36 @@ python benchmark/run.py \
   --output-dir /opt/data/private/fyp/vggt_runs/benchmark_eval
 ```
 
+## Download helpers
+
+This repo also includes benchmark dataset download helpers under `scripts/`:
+
+- `scripts/download_benchmark_scene.py`
+  - intended for downloading one scene locally for adapter development
+  - supports `TransLab` partial scene downloads
+  - for `NeRO`, the official release is not scene-granular, so the local helper downloads the requested official subset package instead
+- `scripts/download_benchmark_all.py`
+  - intended for downloading full datasets on a server for benchmark runs
+
+Examples:
+
+```bash
+python scripts/download_benchmark_scene.py \
+  --dataset translab \
+  --scene scene_01 \
+  --output-root /data/local_benchmarks
+
+python scripts/download_benchmark_scene.py \
+  --dataset nero \
+  --nero-subset GlossySynthetic \
+  --scene bell \
+  --output-root /data/local_benchmarks
+
+python scripts/download_benchmark_all.py \
+  --dataset all \
+  --output-root /data/server_benchmarks
+```
+
 ## Extending to another dataset
 
 Add a new adapter under `benchmark/adapters/` and register it in
