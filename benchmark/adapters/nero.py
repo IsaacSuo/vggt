@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import itertools
+import json
 import pickle
 import struct
 import tarfile
@@ -17,6 +18,10 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from scipy.spatial import cKDTree
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional dependency for rasterized mesh masks
+    cv2 = None
 
 try:
     import trimesh
@@ -27,7 +32,8 @@ from benchmark.adapters.base import BenchmarkDatasetAdapter, BenchmarkSample
 from benchmark.plan import DatasetSpec
 
 
-_NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION = "v2"
+_NERO_GLOSSYREAL_MESH_ALIGNMENT_CACHE_VERSION = "v3"
+_NERO_GLOSSYREAL_MESH_ALIGNMENT_MAP_FILENAME = "nero_glossyreal_mesh_alignment_v2.json"
 _PLY_NUMPY_DTYPE_MAP = {
     "char": "i1",
     "uchar": "u1",
@@ -199,6 +205,14 @@ def _extract_zip_member(zip_path: Path, member_name: str, output_path: Path) -> 
         with zf.open(member_name, "r") as src, output_path.open("wb") as dst:
             dst.write(src.read())
     return output_path
+
+
+def _load_mesh_alignment_map(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict) or "scenes" not in payload or not isinstance(payload["scenes"], dict):
+        raise ValueError(f"Invalid NeRO GlossyReal mesh alignment map: {path}")
+    return payload
 
 
 def _stable_seed_from_text(text: str) -> int:
@@ -576,6 +590,93 @@ def _project_object_points_to_mask(
     return mask > 0.5
 
 
+def _simplify_mesh_vertex_clustering(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    cluster_size: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if cluster_size <= 0:
+        return vertices, faces
+
+    grid = np.floor(vertices / cluster_size).astype(np.int64)
+    _, inverse = np.unique(grid, axis=0, return_inverse=True)
+
+    simplified_vertices = np.zeros((inverse.max() + 1, 3), dtype=np.float64)
+    counts = np.bincount(inverse)
+    np.add.at(simplified_vertices, inverse, vertices)
+    simplified_vertices /= counts[:, None]
+
+    simplified_faces = inverse[faces]
+    valid = (
+        (simplified_faces[:, 0] != simplified_faces[:, 1])
+        & (simplified_faces[:, 1] != simplified_faces[:, 2])
+        & (simplified_faces[:, 0] != simplified_faces[:, 2])
+    )
+    simplified_faces = simplified_faces[valid]
+    if simplified_faces.shape[0] == 0:
+        return simplified_vertices, simplified_faces
+
+    dedup_key = np.sort(simplified_faces, axis=1)
+    _, unique_indices = np.unique(dedup_key, axis=0, return_index=True)
+    simplified_faces = simplified_faces[np.sort(unique_indices)]
+    return simplified_vertices, simplified_faces
+
+
+def _project_world_vertices(
+    vertices_world: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    cam_points = vertices_world @ extrinsic[:, :3].transpose() + extrinsic[:, 3]
+    depth = cam_points[:, 2]
+    u = intrinsic[0, 0] * (cam_points[:, 0] / np.maximum(depth, 1e-8)) + intrinsic[0, 2]
+    v = intrinsic[1, 1] * (cam_points[:, 1] / np.maximum(depth, 1e-8)) + intrinsic[1, 2]
+    return np.stack([u, v], axis=-1), cam_points
+
+
+def _rasterize_mesh_mask(
+    vertices_world: np.ndarray,
+    faces: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    image_hw: Tuple[int, int],
+) -> np.ndarray:
+    if cv2 is None:
+        raise ImportError(
+            "Rasterized NeRO GlossyReal mesh masks require `opencv-python` / `cv2` in the current environment."
+        )
+
+    height, width = image_hw
+    uv, cam_points = _project_world_vertices(vertices_world, extrinsic, intrinsic)
+    tri_cam = cam_points[faces]
+    tri_uv = uv[faces]
+
+    valid_depth = np.all(tri_cam[:, :, 2] > 1e-6, axis=1)
+    tri_uv = tri_uv[valid_depth]
+    if tri_uv.shape[0] == 0:
+        return np.zeros((height, width), dtype=bool)
+
+    min_xy = tri_uv.min(axis=1)
+    max_xy = tri_uv.max(axis=1)
+    in_view = (
+        (max_xy[:, 0] >= 0)
+        & (max_xy[:, 1] >= 0)
+        & (min_xy[:, 0] < width)
+        & (min_xy[:, 1] < height)
+    )
+    tri_uv = tri_uv[in_view]
+    if tri_uv.shape[0] == 0:
+        return np.zeros((height, width), dtype=bool)
+
+    polygons = np.rint(tri_uv).astype(np.int32)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    chunk_size = 5000
+    for start in range(0, polygons.shape[0], chunk_size):
+        chunk = polygons[start : start + chunk_size]
+        cv2.fillPoly(mask, chunk, color=255, lineType=cv2.LINE_8)
+    return mask > 0
+
+
 class NeROGlossySyntheticAdapter(BenchmarkDatasetAdapter):
     def __init__(self, spec: DatasetSpec):
         super().__init__(spec)
@@ -845,11 +946,21 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 Path(tempfile.gettempdir()) / "vggt_benchmark_nero_glossyreal_meshes",
             )
         ).expanduser()
+        mesh_alignment_map_path = config.get("mesh_alignment_map_path")
+        if mesh_alignment_map_path is None:
+            mesh_alignment_map_path = Path(__file__).with_name(_NERO_GLOSSYREAL_MESH_ALIGNMENT_MAP_FILENAME)
+        self.mesh_alignment_map_path = Path(mesh_alignment_map_path).expanduser()
+        self.mesh_alignment_map = (
+            _load_mesh_alignment_map(self.mesh_alignment_map_path)
+            if self.mesh_alignment_map_path.exists()
+            else None
+        )
         self.mesh_alignment_source_points = int(config.get("mesh_alignment_source_points", 12000))
         self.mesh_alignment_target_points = int(config.get("mesh_alignment_target_points", 12000))
         self.mesh_alignment_score_points = int(config.get("mesh_alignment_score_points", 50000))
         self.mesh_alignment_candidate_topk = int(config.get("mesh_alignment_candidate_topk", 6))
         self.mesh_alignment_icp_iterations = int(config.get("mesh_alignment_icp_iterations", 20))
+        self.mesh_mask_cluster_ratio = float(config.get("mesh_mask_cluster_ratio", 1.0 / 250.0))
         self.max_scenes = config.get("max_scenes")
         self.gt_point_sample_points = int(config.get("gt_point_sample_points", 20000))
         self.pred_point_sample_points = int(config.get("pred_point_sample_points", 20000))
@@ -1078,13 +1189,35 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
 
         mesh = _load_trimesh_mesh(raw_mesh_path)
         mesh_vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        transform, stats = self._estimate_mesh_alignment_transform(
-            scene_name=scene_name,
-            mesh_vertices=mesh_vertices,
-            object_points_world=object_points_world,
-        )
+
+        transform = None
+        stats: Dict[str, object]
+        if self.mesh_alignment_map is not None:
+            scene_entry = self.mesh_alignment_map["scenes"].get(scene_name)
+            if scene_entry is not None:
+                transform = np.asarray(scene_entry["transform"], dtype=np.float64)
+                stats = dict(scene_entry)
+                stats.pop("transform", None)
+                stats.update({
+                    "cache_hit": False,
+                    "alignment_source": "precomputed_map",
+                    "alignment_map_path": str(self.mesh_alignment_map_path),
+                })
+            else:
+                stats = {}
+        else:
+            stats = {}
+
+        if transform is None:
+            transform, estimated_stats = self._estimate_mesh_alignment_transform(
+                scene_name=scene_name,
+                mesh_vertices=mesh_vertices,
+                object_points_world=object_points_world,
+            )
+            stats.update(estimated_stats)
+            stats["alignment_source"] = "runtime_3d_registration"
+
         aligned_vertices = _export_aligned_mesh(mesh, transform, aligned_mesh_path)
-        stats = dict(stats)
         stats["cache_hit"] = False
         return aligned_mesh_path, aligned_vertices, stats
 
@@ -1155,6 +1288,8 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 )
 
                 gt_mesh_path = None
+                raster_mesh_vertices = None
+                raster_mesh_faces = None
                 if self.reconstruction_gt_source == "mesh_gt_zip":
                     mesh_member = scene.get("mesh_member")
                     if mesh_member is None:
@@ -1174,6 +1309,20 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                     gt_mesh_path = str(mesh_path)
                     gt_points = torch.from_numpy(aligned_vertices)
                     object_points_np = aligned_vertices
+                    aligned_mesh = _load_trimesh_mesh(Path(gt_mesh_path))
+                    aligned_mesh_vertices = np.asarray(aligned_mesh.vertices, dtype=np.float64)
+                    aligned_mesh_faces = np.asarray(aligned_mesh.faces, dtype=np.int32)
+                    bbox_diag = float(
+                        np.linalg.norm(
+                            aligned_mesh_vertices.max(axis=0) - aligned_mesh_vertices.min(axis=0)
+                        )
+                    )
+                    cluster_size = bbox_diag * self.mesh_mask_cluster_ratio
+                    raster_mesh_vertices, raster_mesh_faces = _simplify_mesh_vertex_clustering(
+                        vertices=aligned_mesh_vertices,
+                        faces=aligned_mesh_faces,
+                        cluster_size=cluster_size,
+                    )
                 else:
                     gt_points = self._load_scene_gt_points(tf, str(scene["gt_points_member"]))
                     if object_points is None:
@@ -1190,15 +1339,24 @@ class NeROGlossyRealAdapter(BenchmarkDatasetAdapter):
                 )
                 object_masks = []
                 for extrinsic, intrinsic in zip(extrinsics, intrinsics):
-                    object_mask = _project_object_points_to_mask(
-                        points_world=object_points_np,
-                        extrinsic=np.asarray(extrinsic, dtype=np.float32),
-                        intrinsic=np.asarray(intrinsic, dtype=np.float32),
-                        image_hw=(self.image_size, self.image_size),
-                        point_radius=self.object_mask_point_radius,
-                        dilation_kernel_size=self.object_mask_dilation_kernel_size,
-                        projection_trim_quantile=self.object_mask_projection_trim_quantile,
-                    )
+                    if gt_mesh_path is not None:
+                        object_mask = _rasterize_mesh_mask(
+                            vertices_world=np.asarray(raster_mesh_vertices, dtype=np.float64),
+                            faces=np.asarray(raster_mesh_faces, dtype=np.int32),
+                            extrinsic=np.asarray(extrinsic, dtype=np.float32),
+                            intrinsic=np.asarray(intrinsic, dtype=np.float32),
+                            image_hw=(self.image_size, self.image_size),
+                        )
+                    else:
+                        object_mask = _project_object_points_to_mask(
+                            points_world=object_points_np,
+                            extrinsic=np.asarray(extrinsic, dtype=np.float32),
+                            intrinsic=np.asarray(intrinsic, dtype=np.float32),
+                            image_hw=(self.image_size, self.image_size),
+                            point_radius=self.object_mask_point_radius,
+                            dilation_kernel_size=self.object_mask_dilation_kernel_size,
+                            projection_trim_quantile=self.object_mask_projection_trim_quantile,
+                        )
                     object_masks.append(object_mask)
                 object_mask_tensor = torch.from_numpy(np.stack(object_masks))
                 object_mask_coverage = [
