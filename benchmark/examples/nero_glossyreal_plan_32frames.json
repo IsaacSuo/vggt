@@ -1,0 +1,88 @@
+{
+  "seed": 42,
+  "models": [
+    {
+      "name": "baseline_vggt",
+      "checkpoint_path": "/opt/data/private/fyp/vggt/checkpoints/model.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true
+    },
+    {
+      "name": "lora_openmaterial",
+      "checkpoint_path": "/opt/data/private/fyp/vggt_runs/train_disjoint_mem/ckpts/checkpoint.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true,
+      "lora": {
+        "rank": 32,
+        "alpha": 32.0,
+        "dropout": 0.05,
+        "target_modules": [
+          "qkv"
+        ],
+        "target_block_type": "global",
+        "block_indices": null,
+        "freeze_base": false,
+        "merge_after_load": false
+      }
+    },
+    {
+      "name": "lora_openmaterial_few_frames",
+      "checkpoint_path": "/opt/data/private/fyp/vggt_runs/train_disjoint/ckpts/checkpoint.pt",
+      "model_kwargs": {
+        "enable_camera": true,
+        "enable_depth": true,
+        "enable_point": false,
+        "enable_track": false
+      },
+      "strict": false,
+      "use_visual_hull_mask": true,
+      "lora": {
+        "rank": 32,
+        "alpha": 32.0,
+        "dropout": 0.05,
+        "target_modules": [
+          "qkv"
+        ],
+        "target_block_type": "global",
+        "block_indices": null,
+        "freeze_base": false,
+        "merge_after_load": false
+      }
+    }
+  ],
+  "datasets": [
+    {
+      "name": "nero_glossyreal_server_32frames",
+      "type": "nero_glossy_real",
+      "config": {
+        "data_path": "/opt/data/private/dataset/benchmark/nero/GlossyReal.tar.gz",
+        "num_frames": 32,
+        "frame_selection": "evenly_spaced",
+        "img_size": 518,
+        "reconstruction_gt_source": "mesh_gt_zip",
+        "mesh_gt_zip_path": "/opt/data/private/dataset/benchmark/nero/glossy-real-meshes-gt.zip",
+        "object_mask_point_radius": 2,
+        "object_mask_dilation_kernel_size": 7,
+        "object_mask_projection_trim_quantile": 0.05,
+        "camera_min_shared_sparse_points": 16,
+        "pred_point_sample_points": 20000,
+        "gt_point_sample_points": 20000,
+        "small_translation_epsilon": 0.0001,
+        "tsdf_resolution": 256,
+        "tsdf_sdf_trunc_factor": 4.0
+      }
+    }
+  ]
+}
